@@ -23,39 +23,26 @@ git add .
 git commit -m "Production release v1.0.0"
 
 # 5. Connect to your GitHub / Hosting remote repository
-git remote add origin https://github.com/YOUR_USERNAME/YOUR_PROD_REPO.git
+git remote add origin https://github.com/ayushistop-cloud/AP-Vd-down.git
 
 # 6. Push ONLY the compiled application to GitHub / Web
-git push -u origin main
+git push -u origin main --force
 ```
 
 ---
 
-## 🛠️ How to Run in Production
+## 🛠️ How to Run in Production (Render / Railway / VPS)
 
-### Option 1: VPS / Direct Node.js Host
-1. Install production dependencies:
+### Render / Railway / PaaS Deployment
+1. Point your service build command to:
    ```bash
    npm install --omit=dev
    ```
-2. Configure environment variables:
-   ```bash
-   cp .env.example .env
-   ```
-   *(Edit `.env` to set your `WEB_ORIGINS`, secrets, etc.)*
+   *(Or leave as default - the root `package.json` has a pre-built `build` script: `echo 'Artifacts are pre-built'`)*
 
-3. (Optional) Run database migrations:
-   ```bash
-   npm run migrate
-   ```
-
-4. Start the application:
-   - **API Backend**: `npm run start:api` (or `node apps/api/dist/main.js`)
-   - **Worker Service**: `npm run start:worker` (or `node apps/worker/dist/main.js`)
-   - **Frontend Static Files**: Located in `public/` and `apps/web/dist/` (serve using Nginx, Netlify, Vercel, or static web host).
-
-### Option 2: Windows Quick Test
-Double-click `start-api.bat` to verify the backend server locally.
+2. Set start command:
+   - **API Backend**: `node apps/api/dist/main.js` (or `npm start`)
+   - **Worker Service**: `node apps/worker/dist/main.js` (or `npm run start:worker`)
 
 ---
 

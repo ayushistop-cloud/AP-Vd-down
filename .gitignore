@@ -1,18 +1,21 @@
 # Production Deployment GitIgnore
 # Ignore environment secrets
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+!.env.production.example
 
 # Ignore installed node_modules (install on target environment via npm install --omit=dev)
 node_modules/
 
-# Ignore runtime data, logs, and artifacts
+# Ignore runtime data, logs, and temp files
 data/
 logs/
 artifacts/
 temp/
 *.log
+*.zip
+hero.mp4
 
 # OS metadata
 .DS_Store
