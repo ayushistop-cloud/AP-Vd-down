@@ -52,7 +52,7 @@ async function downloadAsset(assetName) {
       if (existing === expectedSha256) {
         console.log(JSON.stringify({ event: 'setup_engine_skipped', reason: `${VERSION} ${assetName} already installed`, path: destPath }));
         if (process.platform !== 'win32') {
-          try { chmodSync(destPath, 0o755); } catch {}
+          try { chmodSync(destPath, 0o755); } catch { /* ignore platform chmod error */ }
         }
         return destPath;
       }
@@ -82,7 +82,7 @@ async function downloadAsset(assetName) {
   rmSync(destPath, { force: true });
   renameSync(tmpPath, destPath);
   if (process.platform !== 'win32') {
-    try { chmodSync(destPath, 0o755); } catch {}
+    try { chmodSync(destPath, 0o755); } catch { /* ignore platform chmod error */ }
   }
 
   console.log(JSON.stringify({
@@ -109,7 +109,7 @@ async function main() {
     if (existsSync(primaryPath) && primaryPath !== genericLinuxPath) {
       copyFileSync(primaryPath, genericLinuxPath);
       if (process.platform !== 'win32') {
-        try { chmodSync(genericLinuxPath, 0o755); } catch {}
+        try { chmodSync(genericLinuxPath, 0o755); } catch { /* ignore platform chmod error */ }
       }
     }
   }
