@@ -315,32 +315,43 @@ export function classifyYtDlpStderr(stderrTail, timedOut) {
     const text = stderrTail.toLowerCase();
     if (timedOut)
         return appErrors.temporaryProviderError('Processing took too long and was stopped.');
-    // Explicit platform challenges, bot detection, HTTP 403, PO token, JS engine failures MUST NOT be NOT_PUBLIC
-    if (/sign in to confirm|confirm you'?re not a bot|bot|challenge|captcha|po.?token|http error 403|403 forbidden|n-sig|signature extraction|js engine|deno|phantomjs|extractor/i.test(text)) {
-        return appErrors.temporaryProviderError('Platform verification or temporary service bottleneck. Please try again later.');
-    }
-    // NOT_PUBLIC is ONLY returned when there is explicit proof of private or members-only content
+    // 1. Genuine private / login-gated content
     if (/\bprivate video\b|\bmembers-only\b|\bjoin this channel to get access\b|\bthis video is private\b|\baccount is private\b|\bthis content is private\b/i.test(text)) {
         return appErrors.notPublic();
     }
+    // 2. Explicit YouTube Bot / Verification / Challenge
+    if (/sign in to confirm you'?re not a bot|confirm you'?re not a bot|\bpo_token\b|\bpo token\b|n-sig extraction failed|signature extraction failed|bot detection/i.test(text)) {
+        return appErrors.temporaryProviderError('Platform verification is required by YouTube right now. Please try again later.');
+    }
+    // 3. HTTP 403 Forbidden
+    if (/http error 403|403 forbidden/i.test(text)) {
+        return appErrors.temporaryProviderError('The platform temporarily restricted access (HTTP 403). Please try again shortly.');
+    }
+    // 4. Rate limiting (HTTP 429)
     if (/http error 429|too many requests|rate.?limit/i.test(text)) {
         return appErrors.rateLimited('The platform is rate limiting downloads right now. Try again later.');
     }
-    if (/video unavailable|removed by the uploader|has been terminated|does not exist/i.test(text)) {
+    // 5. Video unavailable / removed
+    if (/video unavailable|removed by the uploader|has been terminated|does not exist|this video has been removed/i.test(text)) {
         return appErrors.unsupported('This content is no longer available at the platform.');
     }
+    // 6. Region / Geo Restricted
     if (/geo-?restrict|not available in your country/i.test(text)) {
         return appErrors.notPublic('This content is region-restricted and not available from this service.');
     }
+    // 7. Invalid URL or format missing
     if (/unsupported url|not a valid url|no video formats|no media formats/i.test(text)) {
         return appErrors.unsupported();
     }
+    // 8. Size limit exceeded
     if (/file is larger than|max-filesize/i.test(text)) {
         return appErrors.tooLarge();
     }
+    // 9. Upstream server / network error
     if (/temporary failure|http error 5\d\d|unable to download webpage|connection reset|timed out/i.test(text)) {
         return appErrors.temporaryProviderError();
     }
+    // 10. Default fallback for generic processing failures -> 500 PROCESSING_FAILED (NOT 503)
     return appErrors.processingFailed();
 }
 //# sourceMappingURL=base.js.map
