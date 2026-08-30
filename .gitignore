@@ -1,9 +1,8 @@
 # Production Deployment GitIgnore
 # Ignore environment secrets
 .env
-.env.*
-!.env.example
-!.env.production.example
+.env.local
+.env.*.local
 
 # Ignore installed node_modules (install on target environment via npm install --omit=dev)
 node_modules/

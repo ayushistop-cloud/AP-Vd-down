@@ -31,18 +31,22 @@ git push -u origin main --force
 
 ---
 
-## 🛠️ How to Run in Production (Render / Railway / VPS)
+## 🛠️ How to Run in Production (Render / Railway / Vercel / VPS)
 
 ### Render / Railway / PaaS Deployment
 1. Point your service build command to:
    ```bash
    npm install --omit=dev
    ```
-   *(Or leave as default - the root `package.json` has a pre-built `build` script: `echo 'Artifacts are pre-built'`)*
+   *(Or leave as default - the root `package.json` has a pre-built `build` script and `postinstall` engine hook)*
 
 2. Set start command:
    - **API Backend**: `node apps/api/dist/main.js` (or `npm start`)
    - **Worker Service**: `node apps/worker/dist/main.js` (or `npm run start:worker`)
+
+### Vercel Static Frontend Deployment
+1. Deploy `public/` or `apps/web/dist/` (or set Root Directory to `public/`).
+2. Routing & API proxying to Render backend is configured automatically via `vercel.json`.
 
 ---
 
