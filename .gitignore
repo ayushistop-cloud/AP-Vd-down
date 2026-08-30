@@ -1,0 +1,19 @@
+# Production Deployment GitIgnore
+# Ignore environment secrets
+.env
+.env.local
+.env.*.local
+
+# Ignore installed node_modules (install on target environment via npm install --omit=dev)
+node_modules/
+
+# Ignore runtime data, logs, and artifacts
+data/
+logs/
+artifacts/
+temp/
+*.log
+
+# OS metadata
+.DS_Store
+Thumbs.db

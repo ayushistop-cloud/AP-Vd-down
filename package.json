@@ -1,0 +1,21 @@
+{
+  "name": "3ap-video-downloader-production",
+  "private": true,
+  "version": "0.1.0",
+  "description": "3AP Video Downloader — Production Compiled Release",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "start": "node apps/api/dist/main.js",
+    "start:api": "node apps/api/dist/main.js",
+    "start:worker": "node apps/worker/dist/main.js",
+    "setup:engine": "node scripts/fetch-yt-dlp.mjs",
+    "migrate": "node scripts/migrate.mjs"
+  }
+}

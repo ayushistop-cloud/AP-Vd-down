@@ -1,0 +1,19 @@
+/** Map stable error codes onto HTTP statuses (docs/12-API-SPEC.md rules). */
+export const HTTP_STATUS_BY_CODE = {
+    INVALID_URL: 400,
+    UNSUPPORTED: 422,
+    NOT_PUBLIC: 403,
+    RATE_LIMITED: 429,
+    TOO_LARGE: 413,
+    PLAYLIST_LIMIT: 422,
+    TEMPORARY_PROVIDER_ERROR: 503,
+    PROCESSING_FAILED: 500,
+    CANCELLED: 409,
+    EXPIRED: 410,
+    NOT_FOUND: 404,
+    VALIDATION_ERROR: 400,
+    CONFLICT: 409,
+    INTERNAL: 500,
+    DOWNLOAD_ENGINE_UNAVAILABLE: 503,
+};
+//# sourceMappingURL=status-map.js.map

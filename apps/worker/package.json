@@ -1,0 +1,16 @@
+{
+  "name": "@3ap/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/main.js",
+  "scripts": {
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@3ap/adapters": "*",
+    "@3ap/queue": "*",
+    "@3ap/shared": "*",
+    "@3ap/store": "*"
+  }
+}
