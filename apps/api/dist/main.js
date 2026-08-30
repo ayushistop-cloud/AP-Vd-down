@@ -1,3 +1,4 @@
+import { join } from 'node:path';
 import { createLogger, loadConfig, MetricsRegistry } from '@3ap/shared';
 import { checkEngineAtBoot, createDefaultAdapters } from '@3ap/adapters';
 import { createQueue } from '@3ap/queue';
@@ -15,6 +16,15 @@ export async function startApi() {
     const metrics = new MetricsRegistry();
     let store;
     if (config.DATABASE_URL) {
+        try {
+            const migratePath = join(process.cwd(), 'scripts/migrate.mjs');
+            const { runMigrations } = await import(`file://${migratePath.replace(/\\/g, '/')}`);
+            await runMigrations(config.DATABASE_URL);
+            log.info('database migrations verified/applied on startup');
+        }
+        catch (err) {
+            log.warn('auto-migration startup check warning', { message: err.message });
+        }
         store = new PostgresStore(config.DATABASE_URL);
         log.info('using PostgreSQL store');
     }

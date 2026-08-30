@@ -12,7 +12,7 @@
     "apps/*"
   ],
   "scripts": {
-    "build": "echo 'Artifacts are pre-built'",
+    "build": "npm install --omit=dev && node scripts/migrate.mjs && node scripts/fetch-yt-dlp.mjs && chmod +x bin/* || true",
     "start": "node apps/api/dist/main.js",
     "start:api": "node apps/api/dist/main.js",
     "start:worker": "node apps/worker/dist/main.js",

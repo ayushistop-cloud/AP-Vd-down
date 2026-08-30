@@ -13,7 +13,7 @@
  * Usage: npm run setup:engine
  */
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -35,32 +35,34 @@ const ASSET_BY_PLATFORM = {
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const binDir = join(repoRoot, 'bin');
-const asset = ASSET_BY_PLATFORM[process.platform];
 
-if (!asset) {
-  console.error(JSON.stringify({ event: 'setup_engine_failed', reason: `unsupported platform ${process.platform}; install yt-dlp manually` }));
-  process.exit(1);
-}
+async function downloadAsset(assetName) {
+  mkdirSync(binDir, { recursive: true });
+  const expectedSha256 = CHECKSUMS[assetName];
+  const destPath = join(binDir, assetName);
 
-const expectedSha256 = CHECKSUMS[asset];
-const destPath = join(binDir, asset);
+  if (!expectedSha256) {
+    throw new Error(`unknown asset checksum for ${assetName}`);
+  }
 
-async function main() {
   // Skip when the exact pinned version is already installed and intact.
   try {
     if (statSync(destPath).size > 0) {
       const existing = createHash('sha256').update(readFileSync(destPath)).digest('hex');
       if (existing === expectedSha256) {
-        console.log(JSON.stringify({ event: 'setup_engine_skipped', reason: `${VERSION} already installed`, path: destPath }));
-        return;
+        console.log(JSON.stringify({ event: 'setup_engine_skipped', reason: `${VERSION} ${assetName} already installed`, path: destPath }));
+        if (process.platform !== 'win32') {
+          try { chmodSync(destPath, 0o755); } catch {}
+        }
+        return destPath;
       }
     }
   } catch {
     /* not installed yet */
   }
 
-  console.log(JSON.stringify({ event: 'setup_engine_start', version: VERSION, asset }));
-  const url = `${BASE_URL}/${asset}`;
+  console.log(JSON.stringify({ event: 'setup_engine_start', version: VERSION, asset: assetName }));
+  const url = `${BASE_URL}/${assetName}`;
   const response = await fetch(url);
   if (!response.ok) {
     throw new Error(`download failed: HTTP ${response.status} from ${url}`);
@@ -70,17 +72,18 @@ async function main() {
   const actualSha256 = createHash('sha256').update(buffer).digest('hex');
   if (actualSha256 !== expectedSha256) {
     throw new Error(
-      `integrity check failed for ${asset}: expected ${expectedSha256}, got ${actualSha256}. ` +
+      `integrity check failed for ${assetName}: expected ${expectedSha256}, got ${actualSha256}. ` +
         'Refusing to install. The release or your network may be compromised.',
     );
   }
 
-  mkdirSync(binDir, { recursive: true });
   const tmpPath = `${destPath}.download`;
   writeFileSync(tmpPath, buffer, { mode: 0o755 });
   rmSync(destPath, { force: true });
   renameSync(tmpPath, destPath);
-  if (process.platform !== 'win32') chmodSync(destPath, 0o755);
+  if (process.platform !== 'win32') {
+    try { chmodSync(destPath, 0o755); } catch {}
+  }
 
   console.log(JSON.stringify({
     event: 'setup_engine_complete',
@@ -89,10 +92,30 @@ async function main() {
     sha256: actualSha256,
     bytes: buffer.byteLength,
   }));
+  return destPath;
+}
+
+async function main() {
+  mkdirSync(binDir, { recursive: true });
+
+  const isLinuxOrProd = process.platform === 'linux' || process.env.NODE_ENV === 'production';
+  const primaryAsset = ASSET_BY_PLATFORM[process.platform] || 'yt-dlp_linux';
+
+  const primaryPath = await downloadAsset(primaryAsset);
+
+  // If running on Linux or production or downloading Linux engine, make sure bin/yt-dlp exists and has executable permissions
+  if (isLinuxOrProd || primaryAsset === 'yt-dlp_linux') {
+    const genericLinuxPath = join(binDir, 'yt-dlp');
+    if (existsSync(primaryPath) && primaryPath !== genericLinuxPath) {
+      copyFileSync(primaryPath, genericLinuxPath);
+      if (process.platform !== 'win32') {
+        try { chmodSync(genericLinuxPath, 0o755); } catch {}
+      }
+    }
+  }
 }
 
 main().catch((err) => {
-  rmSync(`${destPath}.download`, { force: true });
   console.error(JSON.stringify({ event: 'setup_engine_failed', message: err.message }));
   process.exit(1);
 });
