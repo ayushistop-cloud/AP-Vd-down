@@ -123,8 +123,11 @@ export class YtDlpBaseAdapter {
     async dumpJson(url, extraArgs, timeoutMs = 45_000) {
         assertPublicHttpUrl(url);
         const binary = await requireBinary(process.env.YT_DLP_PATH, engineLog);
+        const platformArgs = this.platform === 'youtube'
+            ? ['--extractor-args', 'youtube:player_client=android']
+            : [];
         try {
-            const { stdout } = await runYtDlp(binary, ['--dump-single-json', '--no-warnings', '--socket-timeout', '20', ...extraArgs, url], { timeoutMs });
+            const { stdout } = await runYtDlp(binary, ['--dump-single-json', '--no-warnings', '--socket-timeout', '20', ...platformArgs, ...extraArgs, url], { timeoutMs });
             return JSON.parse(stdout);
         }
         catch (err) {
@@ -137,6 +140,9 @@ export class YtDlpBaseAdapter {
         assertPublicHttpUrl(request.sourceUrl);
         const selection = selectSelector(request);
         const args = buildBaseArgs(request.maxFileSizeBytes);
+        if (this.platform === 'youtube') {
+            args.push('--extractor-args', 'youtube:player_client=android');
+        }
         if (selection.audioOnly) {
             args.push('--format', selection.selector ?? 'bestaudio[ext=m4a]/bestaudio');
             const ffmpeg = await findFfmpegBinary(process.env.FFMPEG_PATH);

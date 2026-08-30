@@ -85,6 +85,17 @@ export function canonicalizeUrl(rawUrl) {
         });
         for (const key of toDrop)
             u.searchParams.delete(key);
+        // Strip YouTube Mix playlist parameters (list=RD...) when a video ID (v=) is present
+        const host = u.hostname.toLowerCase();
+        if (host.includes('youtube.com') || host.includes('youtu.be')) {
+            const v = u.searchParams.get('v');
+            const list = u.searchParams.get('list');
+            if (v && list && /^RD/i.test(list.trim())) {
+                u.searchParams.delete('list');
+                u.searchParams.delete('start_radio');
+                u.searchParams.delete('radio');
+            }
+        }
         u.hash = '';
         return u.toString();
     }
