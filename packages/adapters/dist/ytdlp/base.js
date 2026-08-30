@@ -123,14 +123,17 @@ export class YtDlpBaseAdapter {
     async dumpJson(url, extraArgs, timeoutMs = 45_000) {
         assertPublicHttpUrl(url);
         const binary = await requireBinary(process.env.YT_DLP_PATH, engineLog);
+        let stdout = '';
+        let stderrTail = '';
         try {
-            const { stdout } = await runYtDlp(binary, ['--dump-single-json', '--no-warnings', '--socket-timeout', '20', ...extraArgs, url], { timeoutMs });
-            return JSON.parse(stdout);
+            const res = await runYtDlp(binary, ['--dump-single-json', '--no-warnings', '--socket-timeout', '20', ...extraArgs, url], { timeoutMs });
+            stdout = res.stdout;
         }
         catch (err) {
             if (err instanceof YtDlpError) {
+                stderrTail = err.stderrTail;
                 const classified = classifyYtDlpStderr(err.stderrTail, err.timedOut);
-                engineLog.error('yt-dlp resolution failed', {
+                engineLog.error('yt-dlp execution failed', {
                     event: 'yt_dlp_failed',
                     platform: this.platform,
                     url,
@@ -142,6 +145,33 @@ export class YtDlpBaseAdapter {
                 throw classified;
             }
             throw toAppError(err);
+        }
+        const trimmed = stdout.trim();
+        if (!trimmed) {
+            engineLog.error('yt-dlp returned empty metadata stdout', {
+                event: 'yt_dlp_empty_stdout',
+                platform: this.platform,
+                url,
+                stderrTail: stderrTail.slice(-4000),
+            });
+            throw appErrors.processingFailed('The media metadata could not be extracted from the platform.');
+        }
+        try {
+            const firstBrace = trimmed.indexOf('{');
+            const lastBrace = trimmed.lastIndexOf('}');
+            const jsonStr = (firstBrace >= 0 && lastBrace > firstBrace) ? trimmed.slice(firstBrace, lastBrace + 1) : trimmed;
+            return JSON.parse(jsonStr);
+        }
+        catch (parseErr) {
+            engineLog.error('yt-dlp JSON parse failure', {
+                event: 'yt_dlp_json_parse_failed',
+                platform: this.platform,
+                url,
+                stdoutLength: stdout.length,
+                stdoutSnippet: stdout.slice(0, 500),
+                message: parseErr.message,
+            });
+            throw appErrors.processingFailed('Failed to parse media metadata response from provider.');
         }
     }
     /* ── download task ─────────────────────────────────────────────────────── */
