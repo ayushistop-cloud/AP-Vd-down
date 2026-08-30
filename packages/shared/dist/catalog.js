@@ -16,6 +16,13 @@ export const ERROR_CODES = [
     'PROCESSING_FAILED',
     'CANCELLED',
     'EXPIRED',
+    // Domain / Operational Provider & Engine Error Codes
+    'PLATFORM_VERIFICATION',
+    'YOUTUBE_EXTRACTOR_ERROR',
+    'NETWORK_ERROR',
+    'ENGINE_ERROR',
+    'ENGINE_OUTPUT_EMPTY',
+    'ENGINE_OUTPUT_INVALID',
     // Operational
     'NOT_FOUND',
     'VALIDATION_ERROR',

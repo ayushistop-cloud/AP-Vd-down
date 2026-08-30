@@ -125,9 +125,12 @@ export class YtDlpBaseAdapter {
         const binary = await requireBinary(process.env.YT_DLP_PATH, engineLog);
         let stdout = '';
         let stderrTail = '';
+        let durationMs = 0;
+        const hostname = new URL(url).hostname;
         try {
             const res = await runYtDlp(binary, ['--dump-single-json', '--no-warnings', '--socket-timeout', '20', ...extraArgs, url], { timeoutMs });
             stdout = res.stdout;
+            durationMs = res.durationMs;
         }
         catch (err) {
             if (err instanceof YtDlpError) {
@@ -136,11 +139,13 @@ export class YtDlpBaseAdapter {
                 engineLog.error('yt-dlp execution failed', {
                     event: 'yt_dlp_failed',
                     platform: this.platform,
-                    url,
+                    hostname,
                     exitCode: err.exitCode,
                     timedOut: err.timedOut,
-                    stderrTail: err.stderrTail.slice(-4000),
-                    classifiedCode: classified.code,
+                    stdoutBytes: 0,
+                    stderrBytes: err.stderrTail.length,
+                    sanitizedStderrTail: err.stderrTail.slice(-2000),
+                    classification: classified.code,
                 });
                 throw classified;
             }
@@ -151,28 +156,67 @@ export class YtDlpBaseAdapter {
             engineLog.error('yt-dlp returned empty metadata stdout', {
                 event: 'yt_dlp_empty_stdout',
                 platform: this.platform,
-                url,
-                stderrTail: stderrTail.slice(-4000),
+                hostname,
+                stderrTail: stderrTail.slice(-2000),
+                classification: 'ENGINE_OUTPUT_EMPTY',
             });
-            throw appErrors.processingFailed('The media metadata could not be extracted from the platform.');
+            throw appErrors.engineOutputEmpty('The media metadata could not be extracted from the platform.');
         }
+        let parsedJson = null;
+        let parseErrorMsg = '';
+        // Pass 1: Direct JSON parse
         try {
-            const firstBrace = trimmed.indexOf('{');
-            const lastBrace = trimmed.lastIndexOf('}');
-            const jsonStr = (firstBrace >= 0 && lastBrace > firstBrace) ? trimmed.slice(firstBrace, lastBrace + 1) : trimmed;
-            return JSON.parse(jsonStr);
+            parsedJson = JSON.parse(trimmed);
         }
-        catch (parseErr) {
+        catch (e1) {
+            parseErrorMsg = e1.message;
+        }
+        // Pass 2: Extract between first '{' and last '}'
+        if (!parsedJson) {
+            try {
+                const firstBrace = trimmed.indexOf('{');
+                const lastBrace = trimmed.lastIndexOf('}');
+                if (firstBrace >= 0 && lastBrace > firstBrace) {
+                    const jsonStr = trimmed.slice(firstBrace, lastBrace + 1);
+                    parsedJson = JSON.parse(jsonStr);
+                }
+            }
+            catch (e2) {
+                parseErrorMsg = e2.message;
+            }
+        }
+        // Pass 3: Line-by-line NDJSON fallback
+        if (!parsedJson) {
+            const lines = trimmed.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+            for (const line of lines) {
+                if (line.startsWith('{') && line.endsWith('}')) {
+                    try {
+                        const candidate = JSON.parse(line);
+                        if (candidate && (candidate._type || candidate.id || candidate.title || candidate.formats)) {
+                            parsedJson = candidate;
+                            break;
+                        }
+                    }
+                    catch {
+                        /* ignore line parse errors */
+                    }
+                }
+            }
+        }
+        if (!parsedJson || typeof parsedJson !== 'object') {
             engineLog.error('yt-dlp JSON parse failure', {
                 event: 'yt_dlp_json_parse_failed',
                 platform: this.platform,
-                url,
+                hostname,
                 stdoutLength: stdout.length,
+                durationMs,
                 stdoutSnippet: stdout.slice(0, 500),
-                message: parseErr.message,
+                message: parseErrorMsg,
+                classification: 'ENGINE_OUTPUT_INVALID',
             });
-            throw appErrors.processingFailed('Failed to parse media metadata response from provider.');
+            throw appErrors.engineOutputInvalid('Failed to parse media metadata response from provider.');
         }
+        return parsedJson;
     }
     /* ── download task ─────────────────────────────────────────────────────── */
     async createDownloadTask(request, ctx) {
@@ -349,9 +393,9 @@ export function classifyYtDlpStderr(stderrTail, timedOut) {
     if (/\bprivate video\b|\bmembers-only\b|\bjoin this channel to get access\b|\bthis video is private\b|\baccount is private\b|\bthis content is private\b/i.test(text)) {
         return appErrors.notPublic();
     }
-    // 2. Explicit YouTube Bot / Verification / Challenge
-    if (/sign in to confirm you'?re not a bot|confirm you'?re not a bot|\bpo_token\b|\bpo token\b|n-sig extraction failed|signature extraction failed|bot detection/i.test(text)) {
-        return appErrors.temporaryProviderError('Platform verification is required by YouTube right now. Please try again later.');
+    // 2. Explicit YouTube Bot / Verification / Challenge / Age check / PO Token
+    if (/sign in to confirm you['’]?re not a bot|confirm you['’]?re not a bot|sign in to confirm|confirm your age|\bpo_token\b|\bpo token\b|n-sig extraction failed|nsig extraction failed|signature extraction failed|bot detection|bot verification|captcha/i.test(text)) {
+        return appErrors.platformVerification('Platform verification is currently required by the provider. Please try again later.');
     }
     // 3. HTTP 403 Forbidden
     if (/http error 403|403 forbidden/i.test(text)) {
@@ -359,7 +403,7 @@ export function classifyYtDlpStderr(stderrTail, timedOut) {
     }
     // 4. Rate limiting (HTTP 429)
     if (/http error 429|too many requests|rate.?limit/i.test(text)) {
-        return appErrors.rateLimited('The platform is rate limiting downloads right now. Try again later.');
+        return appErrors.rateLimited('Too many requests. Please wait a moment and try again.');
     }
     // 5. Video unavailable / removed
     if (/video unavailable|removed by the uploader|has been terminated|does not exist|this video has been removed/i.test(text)) {
@@ -377,11 +421,15 @@ export function classifyYtDlpStderr(stderrTail, timedOut) {
     if (/file is larger than|max-filesize/i.test(text)) {
         return appErrors.tooLarge();
     }
-    // 9. Upstream server / network error
-    if (/temporary failure|http error 5\d\d|unable to download webpage|connection reset|timed out/i.test(text)) {
-        return appErrors.temporaryProviderError();
+    // 9. Upstream server / network / DNS / TLS error
+    if (/temporary failure|http error 5\d\d|unable to download webpage|connection reset|timed out|could not resolve host|getaddrinfo|tls handshake|socket error/i.test(text)) {
+        return appErrors.networkError('The media provider could not be reached. Please try again.');
     }
-    // 10. Default fallback for generic processing failures -> 500 PROCESSING_FAILED (NOT 503)
-    return appErrors.processingFailed();
+    // 10. YouTube Extractor specific errors
+    if (/\[youtube\]/i.test(text) || /youtube/i.test(text)) {
+        return appErrors.youtubeExtractorError('YouTube media could not be resolved right now. Please try another public video.');
+    }
+    // 11. Generic Engine Error fallback (503 retryable, NOT 500)
+    return appErrors.engineError('The media service is temporarily unavailable.');
 }
 //# sourceMappingURL=base.js.map
