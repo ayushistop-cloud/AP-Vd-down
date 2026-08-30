@@ -95,23 +95,30 @@ async function downloadAsset(assetName) {
   return destPath;
 }
 
+export async function ensureLinuxBinary() {
+  mkdirSync(binDir, { recursive: true });
+  const linuxAssetPath = await downloadAsset('yt-dlp_linux');
+  const genericLinuxPath = join(binDir, 'yt-dlp');
+  if (existsSync(linuxAssetPath) && linuxAssetPath !== genericLinuxPath) {
+    copyFileSync(linuxAssetPath, genericLinuxPath);
+    if (process.platform !== 'win32') {
+      try { chmodSync(genericLinuxPath, 0o755); } catch { /* ignore platform chmod error */ }
+    }
+  }
+  return genericLinuxPath;
+}
+
 async function main() {
   mkdirSync(binDir, { recursive: true });
 
+  const isTargetLinux = process.argv.includes('--target-linux');
   const isLinuxOrProd = process.platform === 'linux' || process.env.NODE_ENV === 'production';
   const primaryAsset = ASSET_BY_PLATFORM[process.platform] || 'yt-dlp_linux';
 
-  const primaryPath = await downloadAsset(primaryAsset);
+  await downloadAsset(primaryAsset);
 
-  // If running on Linux or production or downloading Linux engine, make sure bin/yt-dlp exists and has executable permissions
-  if (isLinuxOrProd || primaryAsset === 'yt-dlp_linux') {
-    const genericLinuxPath = join(binDir, 'yt-dlp');
-    if (existsSync(primaryPath) && primaryPath !== genericLinuxPath) {
-      copyFileSync(primaryPath, genericLinuxPath);
-      if (process.platform !== 'win32') {
-        try { chmodSync(genericLinuxPath, 0o755); } catch { /* ignore platform chmod error */ }
-      }
-    }
+  if (isTargetLinux || isLinuxOrProd || primaryAsset === 'yt-dlp_linux') {
+    await ensureLinuxBinary();
   }
 }
 

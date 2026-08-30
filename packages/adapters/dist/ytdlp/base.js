@@ -123,15 +123,25 @@ export class YtDlpBaseAdapter {
     async dumpJson(url, extraArgs, timeoutMs = 45_000) {
         assertPublicHttpUrl(url);
         const binary = await requireBinary(process.env.YT_DLP_PATH, engineLog);
-        const platformArgs = this.platform === 'youtube'
-            ? ['--extractor-args', 'youtube:player_client=android']
-            : [];
         try {
-            const { stdout } = await runYtDlp(binary, ['--dump-single-json', '--no-warnings', '--socket-timeout', '20', ...platformArgs, ...extraArgs, url], { timeoutMs });
+            const { stdout } = await runYtDlp(binary, ['--dump-single-json', '--no-warnings', '--socket-timeout', '20', ...extraArgs, url], { timeoutMs });
             return JSON.parse(stdout);
         }
         catch (err) {
-            throw err instanceof YtDlpError ? classifyYtDlpStderr(err.stderrTail, err.timedOut) : toAppError(err);
+            if (err instanceof YtDlpError) {
+                const classified = classifyYtDlpStderr(err.stderrTail, err.timedOut);
+                engineLog.error('yt-dlp resolution failed', {
+                    event: 'yt_dlp_failed',
+                    platform: this.platform,
+                    url,
+                    exitCode: err.exitCode,
+                    timedOut: err.timedOut,
+                    stderrTail: err.stderrTail.slice(-4000),
+                    classifiedCode: classified.code,
+                });
+                throw classified;
+            }
+            throw toAppError(err);
         }
     }
     /* ── download task ─────────────────────────────────────────────────────── */
@@ -140,9 +150,6 @@ export class YtDlpBaseAdapter {
         assertPublicHttpUrl(request.sourceUrl);
         const selection = selectSelector(request);
         const args = buildBaseArgs(request.maxFileSizeBytes);
-        if (this.platform === 'youtube') {
-            args.push('--extractor-args', 'youtube:player_client=android');
-        }
         if (selection.audioOnly) {
             args.push('--format', selection.selector ?? 'bestaudio[ext=m4a]/bestaudio');
             const ffmpeg = await findFfmpegBinary(process.env.FFMPEG_PATH);
@@ -189,7 +196,19 @@ export class YtDlpBaseAdapter {
             });
         }
         catch (err) {
-            throw err instanceof YtDlpError ? classifyYtDlpStderr(err.stderrTail, err.timedOut) : toAppError(err);
+            if (err instanceof YtDlpError) {
+                const classified = classifyYtDlpStderr(err.stderrTail, err.timedOut);
+                ctx.log.error('yt-dlp download failed', {
+                    event: 'yt_dlp_download_failed',
+                    platform: this.platform,
+                    exitCode: err.exitCode,
+                    timedOut: err.timedOut,
+                    stderrTail: err.stderrTail.slice(-4000),
+                    classifiedCode: classified.code,
+                });
+                throw classified;
+            }
+            throw toAppError(err);
         }
         const produced = await collectProducedFile(ctx.workDir);
         if (!produced) {
@@ -296,7 +315,12 @@ export function classifyYtDlpStderr(stderrTail, timedOut) {
     const text = stderrTail.toLowerCase();
     if (timedOut)
         return appErrors.temporaryProviderError('Processing took too long and was stopped.');
-    if (/private video|members-only|join this channel|login required|sign in to confirm|requested content is not available|authentication|account is private|this content isn't available/i.test(text)) {
+    // Explicit platform challenges, bot detection, HTTP 403, PO token, JS engine failures MUST NOT be NOT_PUBLIC
+    if (/sign in to confirm|confirm you'?re not a bot|bot|challenge|captcha|po.?token|http error 403|403 forbidden|n-sig|signature extraction|js engine|deno|phantomjs|extractor/i.test(text)) {
+        return appErrors.temporaryProviderError('Platform verification or temporary service bottleneck. Please try again later.');
+    }
+    // NOT_PUBLIC is ONLY returned when there is explicit proof of private or members-only content
+    if (/\bprivate video\b|\bmembers-only\b|\bjoin this channel to get access\b|\bthis video is private\b|\baccount is private\b|\bthis content is private\b/i.test(text)) {
         return appErrors.notPublic();
     }
     if (/http error 429|too many requests|rate.?limit/i.test(text)) {
