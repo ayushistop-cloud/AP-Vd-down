@@ -9,6 +9,24 @@ export function detectJsRuntime() {
     }
     return { name: 'none', available: false };
 }
+/**
+ * Builds an augmented environment where PATH is guaranteed to include the
+ * directory containing process.execPath so yt-dlp can locate Node.js as its
+ * JS runtime (--js-runtimes node) across all deployment environments.
+ */
+export function getAugmentedEnv(baseEnv = process.env) {
+    const env = { ...baseEnv };
+    if (process.execPath) {
+        const nodeDir = dirname(process.execPath);
+        const pathKey = Object.keys(env).find((k) => k.toUpperCase() === 'PATH') || 'PATH';
+        const currentPath = env[pathKey] || '';
+        const sep = process.platform === 'win32' ? ';' : ':';
+        if (!currentPath.split(sep).includes(nodeDir)) {
+            env[pathKey] = currentPath ? `${nodeDir}${sep}${currentPath}` : nodeDir;
+        }
+    }
+    return env;
+}
 export class EngineUnavailableError extends Error {
     checked;
     constructor(message, checked) {
@@ -41,7 +59,7 @@ function probeVersion(binary, timeoutMs = 10_000) {
         let child;
         try {
             // shell:false is mandatory — the path may contain spaces; args are an array.
-            child = spawn(binary, ['--version'], { shell: false, windowsHide: true });
+            child = spawn(binary, ['--version'], { shell: false, windowsHide: true, env: getAugmentedEnv() });
         }
         catch (err) {
             done({ ok: false, reason: `could not start process (${err.message})` });
@@ -293,7 +311,7 @@ export async function runYtDlp(binary, args, options) {
     const maxStdout = options.maxStdoutBytes ?? 64 * 1024 * 1024;
     const started = Date.now();
     return new Promise((resolve, reject) => {
-        const child = spawn(binary, args, { shell: false, windowsHide: true, cwd: options.cwd });
+        const child = spawn(binary, args, { shell: false, windowsHide: true, cwd: options.cwd, env: getAugmentedEnv() });
         let stdout = Buffer.alloc(0);
         let stderrTail = '';
         let killedForTimeout = false;

@@ -1,0 +1,9 @@
+/**
+ * Stable error codes from docs/25-ERROR-CATALOG.md.
+ * Additional operational codes (NOT_FOUND, VALIDATION_ERROR, CONFLICT,
+ * INTERNAL) cover API plumbing concerns; the catalog codes are the only ones
+ * ever surfaced for domain failures.
+ */
+export declare const ERROR_CODES: readonly ["INVALID_URL", "UNSUPPORTED", "NOT_PUBLIC", "RATE_LIMITED", "TOO_LARGE", "PLAYLIST_LIMIT", "TEMPORARY_PROVIDER_ERROR", "PROCESSING_FAILED", "CANCELLED", "EXPIRED", "PLATFORM_VERIFICATION", "YOUTUBE_EXTRACTOR_ERROR", "NETWORK_ERROR", "ENGINE_ERROR", "ENGINE_OUTPUT_EMPTY", "ENGINE_OUTPUT_INVALID", "NOT_FOUND", "VALIDATION_ERROR", "CONFLICT", "INTERNAL", "DOWNLOAD_ENGINE_UNAVAILABLE"];
+export type ErrorCode = (typeof ERROR_CODES)[number];
+//# sourceMappingURL=catalog.d.ts.map

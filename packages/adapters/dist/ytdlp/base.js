@@ -68,6 +68,9 @@ export function getValidCookiesPath() {
             if (isValidNetscapeCookieFile(trimmed)) {
                 return trimmed;
             }
+            engineLog.warn('Configured cookie file path is missing, unreadable, empty, or not valid Netscape format; ignoring cookies', {
+                cookiePathConfigured: true,
+            });
         }
     }
     const renderSecretsPath = '/etc/secrets/cookies.txt';
@@ -228,59 +231,62 @@ export class YtDlpBaseAdapter {
             clientConfig: this.platform === 'youtube' ? 'default' : undefined,
             hostname,
         });
+        const runWithFallback = async (argsToRun, allowFallback) => {
+            try {
+                return await runYtDlp(binary, argsToRun, { timeoutMs });
+            }
+            catch (err) {
+                if (err instanceof YtDlpError) {
+                    stderrTail = err.stderrTail;
+                    const isCookieErr = /does not look like a netscape format cookies file|invalid cookies? file|error loading cookies/i.test(err.stderrTail);
+                    if (isCookieErr && argsToRun.includes('--cookies')) {
+                        engineLog.warn('yt-dlp rejected server cookies configuration; retrying request without cookies', {
+                            platform: this.platform,
+                            hostname,
+                        });
+                        const argsNoCookies = argsToRun.filter((arg, idx) => arg !== '--cookies' && argsToRun[idx - 1] !== '--cookies');
+                        return runWithFallback(argsNoCookies, false);
+                    }
+                    const isVerification = /sign in to confirm you['’]?re not a bot|confirm you['’]?re not a bot|sign in to confirm|confirm your age|\bpo_token\b|\bpo token\b|bot detection|bot verification|captcha/i.test(err.stderrTail);
+                    if (allowFallback && this.platform === 'youtube' && (isVerification || /http error 403|403 forbidden/i.test(err.stderrTail))) {
+                        engineLog.info('YouTube extraction encountered provider verification; attempting safe fallback client configuration', {
+                            platform: this.platform,
+                            hostname,
+                            fallbackClient: 'mweb,web',
+                        });
+                        const fallbackArgs = [
+                            '--extractor-args',
+                            'youtube:player_client=mweb,web',
+                            ...argsToRun.filter((a) => a !== '--extractor-args' && !a.startsWith('youtube:player_client')),
+                        ];
+                        return runWithFallback(fallbackArgs, false);
+                    }
+                }
+                throw err;
+            }
+        };
         try {
             const cookieArgs = getCookiesArgs();
-            const res = await runYtDlp(binary, ['--dump-single-json', '--no-warnings', '--socket-timeout', '20', ...platformArgs, ...cookieArgs, ...extraArgs, url], { timeoutMs });
+            const initialArgs = ['--dump-single-json', '--no-warnings', '--socket-timeout', '20', ...platformArgs, ...cookieArgs, ...extraArgs, url];
+            const res = await runWithFallback(initialArgs, true);
             stdout = res.stdout;
             durationMs = res.durationMs;
         }
         catch (err) {
             if (err instanceof YtDlpError) {
-                if (/does not look like a netscape format cookies file|invalid cookies? file|error loading cookies/i.test(err.stderrTail)) {
-                    engineLog.warn('yt-dlp rejected server cookies configuration; retrying request without cookies', {
-                        platform: this.platform,
-                        hostname,
-                    });
-                    try {
-                        const retryRes = await runYtDlp(binary, ['--dump-single-json', '--no-warnings', '--socket-timeout', '20', ...platformArgs, ...extraArgs, url], { timeoutMs });
-                        stdout = retryRes.stdout;
-                        durationMs = retryRes.durationMs;
-                    }
-                    catch (retryErr) {
-                        if (retryErr instanceof YtDlpError) {
-                            const classified = classifyYtDlpStderr(retryErr.stderrTail, retryErr.timedOut);
-                            engineLog.warn('yt-dlp metadata request failed', {
-                                event: 'yt_dlp_failed',
-                                platform: this.platform,
-                                hostname,
-                                ytDlpVersion: version,
-                                jsRuntime,
-                                cookiesState: 'disabled',
-                                classification: classified.code,
-                            });
-                            throw classified;
-                        }
-                        throw toAppError(retryErr);
-                    }
-                }
-                else {
-                    stderrTail = err.stderrTail;
-                    const classified = classifyYtDlpStderr(err.stderrTail, err.timedOut);
-                    engineLog.warn('yt-dlp metadata request failed', {
-                        event: 'yt_dlp_failed',
-                        platform: this.platform,
-                        hostname,
-                        ytDlpVersion: version,
-                        jsRuntime,
-                        cookiesState: cookiePath ? 'enabled' : 'disabled',
-                        classification: classified.code,
-                    });
-                    throw classified;
-                }
+                const classified = classifyYtDlpStderr(err.stderrTail, err.timedOut);
+                engineLog.warn('yt-dlp metadata request failed', {
+                    event: 'yt_dlp_failed',
+                    platform: this.platform,
+                    hostname,
+                    ytDlpVersion: version,
+                    jsRuntime,
+                    cookiesState: cookiePath ? 'enabled' : 'disabled',
+                    classification: classified.code,
+                });
+                throw classified;
             }
-            else {
-                throw toAppError(err);
-            }
+            throw toAppError(err);
         }
         const trimmed = stdout.trim();
         if (!trimmed) {
@@ -392,57 +398,53 @@ export class YtDlpBaseAdapter {
                 }
             }
         };
+        const runDownloadWithFallback = async (argsToRun, allowFallback) => {
+            try {
+                await runYtDlp(binary, argsToRun, {
+                    timeoutMs: 15 * 60 * 1000,
+                    abort: ctx.signal,
+                    cwd: absWorkDir,
+                    onStdoutLine: onLine,
+                    onStderrLine: (line) => ctx.log.debug('yt-dlp stderr', { line: line.trim().slice(0, 300) }),
+                });
+            }
+            catch (err) {
+                if (err instanceof YtDlpError) {
+                    const isCookieErr = /does not look like a netscape format cookies file|invalid cookies? file|error loading cookies/i.test(err.stderrTail);
+                    if (isCookieErr && argsToRun.includes('--cookies')) {
+                        ctx.log.warn('yt-dlp rejected cookie file during download; retrying without cookies');
+                        const argsNoCookies = argsToRun.filter((arg, idx) => arg !== '--cookies' && argsToRun[idx - 1] !== '--cookies');
+                        return runDownloadWithFallback(argsNoCookies, false);
+                    }
+                    const isVerification = /sign in to confirm you['’]?re not a bot|confirm you['’]?re not a bot|sign in to confirm|confirm your age|\bpo_token\b|\bpo token\b|bot detection|bot verification|captcha/i.test(err.stderrTail);
+                    if (allowFallback && this.platform === 'youtube' && (isVerification || /http error 403|403 forbidden/i.test(err.stderrTail))) {
+                        ctx.log.info('YouTube download encountered provider verification; attempting safe fallback client configuration');
+                        const fallbackArgs = [
+                            '--extractor-args',
+                            'youtube:player_client=mweb,web',
+                            ...argsToRun,
+                        ];
+                        return runDownloadWithFallback(fallbackArgs, false);
+                    }
+                }
+                throw err;
+            }
+        };
         try {
-            await runYtDlp(binary, args, {
-                timeoutMs: 15 * 60 * 1000,
-                abort: ctx.signal,
-                cwd: absWorkDir,
-                onStdoutLine: onLine,
-                onStderrLine: (line) => ctx.log.debug('yt-dlp stderr', { line: line.trim().slice(0, 300) }),
-            });
+            await runDownloadWithFallback(args, true);
         }
         catch (err) {
             if (err instanceof YtDlpError) {
-                if (/does not look like a netscape format cookies file|invalid cookies? file|error loading cookies/i.test(err.stderrTail)) {
-                    ctx.log.warn('yt-dlp rejected cookie file during download; retrying without cookies');
-                    const argsNoCookies = args.filter((arg, idx) => arg !== '--cookies' && args[idx - 1] !== '--cookies');
-                    try {
-                        await runYtDlp(binary, argsNoCookies, {
-                            timeoutMs: 15 * 60 * 1000,
-                            abort: ctx.signal,
-                            cwd: absWorkDir,
-                            onStdoutLine: onLine,
-                            onStderrLine: (line) => ctx.log.debug('yt-dlp stderr', { line: line.trim().slice(0, 300) }),
-                        });
-                    }
-                    catch (retryErr) {
-                        if (retryErr instanceof YtDlpError) {
-                            const classified = classifyYtDlpStderr(retryErr.stderrTail, retryErr.timedOut);
-                            ctx.log.error('yt-dlp download failed', {
-                                event: 'yt_dlp_download_failed',
-                                platform: this.platform,
-                                exitCode: retryErr.exitCode,
-                                timedOut: retryErr.timedOut,
-                                stderrTail: retryErr.stderrTail.slice(-4000),
-                                classifiedCode: classified.code,
-                            });
-                            throw classified;
-                        }
-                        throw toAppError(retryErr);
-                    }
-                }
-                else {
-                    const classified = classifyYtDlpStderr(err.stderrTail, err.timedOut);
-                    ctx.log.error('yt-dlp download failed', {
-                        event: 'yt_dlp_download_failed',
-                        platform: this.platform,
-                        exitCode: err.exitCode,
-                        timedOut: err.timedOut,
-                        stderrTail: err.stderrTail.slice(-4000),
-                        classifiedCode: classified.code,
-                    });
-                    throw classified;
-                }
+                const classified = classifyYtDlpStderr(err.stderrTail, err.timedOut);
+                ctx.log.error('yt-dlp download failed', {
+                    event: 'yt_dlp_download_failed',
+                    platform: this.platform,
+                    exitCode: err.exitCode,
+                    timedOut: err.timedOut,
+                    stderrTail: err.stderrTail.slice(-4000),
+                    classifiedCode: classified.code,
+                });
+                throw classified;
             }
             else {
                 throw toAppError(err);

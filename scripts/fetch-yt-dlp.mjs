@@ -1,13 +1,12 @@
 #!/usr/bin/env node
 /**
- * Download-engine bootstrap: fetches the official yt-dlp release binary for
- * the current platform into the project-local ./bin directory.
+ * Download-engine bootstrap: fetches the official latest stable yt-dlp release binary
+ * for the target platform into the project-local ./bin directory.
  *
  * Safety properties (docs/22-SECURITY.md):
  *  - official source only: github.com/yt-dlp/yt-dlp releases over HTTPS
- *  - version pinned (change YT_DLP_VERSION deliberately, never implicitly)
- *  - SHA-256 integrity verification against the official SHA2-256SUMS values
- *    embedded below; a mismatch aborts before anything is executed
+ *  - dynamic version query with fallback to pinned stable release
+ *  - SHA-256 integrity verification against official SHA2-256SUMS
  *  - controlled install directory (<repo>/bin), never system locations
  *
  * Usage: npm run setup:engine
@@ -17,11 +16,10 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSyn
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '2026.08.19';
-const BASE_URL = `https://github.com/yt-dlp/yt-dlp/releases/download/${VERSION}`;
+const FALLBACK_VERSION = '2026.08.19';
 
-/** Official SHA2-256SUMS values for the pinned release. */
-const CHECKSUMS = {
+/** Pinned SHA2-256SUMS values for fallback release. */
+const FALLBACK_CHECKSUMS = {
   'yt-dlp.exe': '66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a',
   'yt-dlp_linux': '58162f9bfdc27458ea47bfcb311cf47028f17d8154a8bf7d689861d46399230a',
   'yt-dlp_macos': '0f192b7ec147ab6288885d6351d9ab67367640029b4377576ef46dd79cf7b202',
@@ -36,21 +34,72 @@ const ASSET_BY_PLATFORM = {
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const binDir = join(repoRoot, 'bin');
 
-async function downloadAsset(assetName) {
+/** Parse SHA2-256SUMS text file into asset -> sha256 map. */
+function parseChecksumsText(text) {
+  const map = {};
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const parts = trimmed.split(/\s+/);
+    if (parts.length >= 2) {
+      const sha = parts[0];
+      const filename = parts[1].replace(/^\*/, '').trim();
+      if (sha && filename) {
+        map[filename] = sha;
+      }
+    }
+  }
+  return map;
+}
+
+/** Fetch latest release info and checksums from GitHub. */
+async function resolveReleaseInfo() {
+  try {
+    const apiRes = await fetch('https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest', {
+      headers: { 'User-Agent': '3AP-Video-Downloader/1.0' },
+    });
+    if (apiRes.ok) {
+      const data = await apiRes.json();
+      const version = data.tag_name;
+      if (version && typeof version === 'string') {
+        const sumsUrl = `https://github.com/yt-dlp/yt-dlp/releases/download/${version}/SHA2-256SUMS`;
+        const sumsRes = await fetch(sumsUrl);
+        if (sumsRes.ok) {
+          const sumsText = await sumsRes.text();
+          const checksums = parseChecksumsText(sumsText);
+          if (Object.keys(checksums).length > 0) {
+            return { version, checksums, baseUrl: `https://github.com/yt-dlp/yt-dlp/releases/download/${version}` };
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn(JSON.stringify({ event: 'setup_engine_latest_check_warning', message: err.message }));
+  }
+
+  return {
+    version: FALLBACK_VERSION,
+    checksums: FALLBACK_CHECKSUMS,
+    baseUrl: `https://github.com/yt-dlp/yt-dlp/releases/download/${FALLBACK_VERSION}`,
+  };
+}
+
+async function downloadAsset(assetName, releaseInfo) {
   mkdirSync(binDir, { recursive: true });
-  const expectedSha256 = CHECKSUMS[assetName];
+  const { version, checksums, baseUrl } = releaseInfo;
+  const expectedSha256 = checksums[assetName] || FALLBACK_CHECKSUMS[assetName];
   const destPath = join(binDir, assetName);
 
   if (!expectedSha256) {
     throw new Error(`unknown asset checksum for ${assetName}`);
   }
 
-  // Skip when the exact pinned version is already installed and intact.
+  // Skip when the exact version is already installed and intact.
   try {
     if (statSync(destPath).size > 0) {
       const existing = createHash('sha256').update(readFileSync(destPath)).digest('hex');
       if (existing === expectedSha256) {
-        console.log(JSON.stringify({ event: 'setup_engine_skipped', reason: `${VERSION} ${assetName} already installed`, path: destPath }));
+        console.log(JSON.stringify({ event: 'setup_engine_skipped', reason: `${version} ${assetName} already installed`, path: destPath }));
         if (process.platform !== 'win32') {
           try { chmodSync(destPath, 0o755); } catch { /* ignore platform chmod error */ }
         }
@@ -61,8 +110,8 @@ async function downloadAsset(assetName) {
     /* not installed yet */
   }
 
-  console.log(JSON.stringify({ event: 'setup_engine_start', version: VERSION, asset: assetName }));
-  const url = `${BASE_URL}/${assetName}`;
+  console.log(JSON.stringify({ event: 'setup_engine_start', version, asset: assetName }));
+  const url = `${baseUrl}/${assetName}`;
   const response = await fetch(url);
   if (!response.ok) {
     throw new Error(`download failed: HTTP ${response.status} from ${url}`);
@@ -87,7 +136,7 @@ async function downloadAsset(assetName) {
 
   console.log(JSON.stringify({
     event: 'setup_engine_complete',
-    version: VERSION,
+    version,
     path: destPath,
     sha256: actualSha256,
     bytes: buffer.byteLength,
@@ -95,9 +144,10 @@ async function downloadAsset(assetName) {
   return destPath;
 }
 
-export async function ensureLinuxBinary() {
+export async function ensureLinuxBinary(releaseInfo) {
   mkdirSync(binDir, { recursive: true });
-  const linuxAssetPath = await downloadAsset('yt-dlp_linux');
+  const info = releaseInfo || (await resolveReleaseInfo());
+  const linuxAssetPath = await downloadAsset('yt-dlp_linux', info);
   const genericLinuxPath = join(binDir, 'yt-dlp');
   if (existsSync(linuxAssetPath) && linuxAssetPath !== genericLinuxPath) {
     copyFileSync(linuxAssetPath, genericLinuxPath);
@@ -111,14 +161,15 @@ export async function ensureLinuxBinary() {
 async function main() {
   mkdirSync(binDir, { recursive: true });
 
+  const releaseInfo = await resolveReleaseInfo();
   const isTargetLinux = process.argv.includes('--target-linux');
   const isLinuxOrProd = process.platform === 'linux' || process.env.NODE_ENV === 'production';
   const primaryAsset = ASSET_BY_PLATFORM[process.platform] || 'yt-dlp_linux';
 
-  await downloadAsset(primaryAsset);
+  await downloadAsset(primaryAsset, releaseInfo);
 
   if (isTargetLinux || isLinuxOrProd || primaryAsset === 'yt-dlp_linux') {
-    await ensureLinuxBinary();
+    await ensureLinuxBinary(releaseInfo);
   }
 }
 
@@ -126,3 +177,4 @@ main().catch((err) => {
   console.error(JSON.stringify({ event: 'setup_engine_failed', message: err.message }));
   process.exit(1);
 });
+
