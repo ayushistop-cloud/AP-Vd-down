@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { appErrors, assertPublicHttpUrl, hashWithPepper, newId, safeArtifactPath, signExpiringToken, toAppError, verifyExpiringToken, HTTP_STATUS_BY_CODE, jobIdParamSchema, createJobRequestSchema, resolveRequestSchema, } from '@3ap/shared';
-import { getValidCookiesPath, requireBinary, runYtDlp } from '@3ap/adapters';
+import { getValidCookiesPath, requireBinary, runYtDlp, runSelfDiagnostics } from '@3ap/adapters';
 import { SlidingWindowRateLimiter } from './lib/rate-limit.js';
 import { ResolveService } from './services/resolve-service.js';
 import { JobService } from './services/job-service.js';
@@ -182,6 +182,24 @@ export async function buildApp(deps) {
             cancelled,
             status: updated.status,
         };
+    });
+    /* ── Self-Diagnostics Endpoint (Phase 2) ──────────────────────────────── */
+    app.get('/api/v1/diagnostics/ytdlp', async (request, reply) => {
+        const query = (request.query ?? {});
+        const headers = request.headers;
+        const secretFromHeader = headers['x-diagnostic-secret'];
+        const secretFromEnv = process.env.DIAGNOSTIC_SECRET;
+        const isEnabled = process.env.ENABLE_DIAGNOSTICS === 'true';
+        const isAuthorized = isEnabled ||
+            (secretFromEnv && (secretFromHeader === secretFromEnv || query.secret === secretFromEnv));
+        if (!isAuthorized) {
+            void reply.code(403);
+            return { error: 'Forbidden. Set ENABLE_DIAGNOSTICS=true or supply valid x-diagnostic-secret header.' };
+        }
+        const testUrl = query.testUrl || 'https://www.youtube.com/watch?v=jNQXAC9IVRw';
+        const diagResult = await runSelfDiagnostics(testUrl);
+        void reply.code(200);
+        return diagResult;
     });
     /* ── downloads ─────────────────────────────────────────────────────────── */
     async function handleDownload(request, reply) {

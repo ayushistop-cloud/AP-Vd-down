@@ -1,6 +1,10 @@
 import { type AdapterCapabilities, type AppError } from '@3ap/shared';
 import type { DownloadRequest, DownloadTaskContext, DownloadTaskResult, MediaAdapter, ResolveOutput } from '../contract.js';
 /**
+ * Sanitizes stderr text to ensure tokens, signatures, and cookies are never logged.
+ */
+export declare function sanitizeStderr(stderr: string): string;
+/**
  * Validates whether a file path exists, is a readable file, non-empty, and has a valid Netscape HTTP Cookie format structure.
  * Never logs cookie contents or sensitive secrets.
  */

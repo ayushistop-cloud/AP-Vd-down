@@ -5,6 +5,18 @@ import { appErrors, assertPublicHttpUrl, buildFileName, canonicalizeUrl, createL
 import { detectJsRuntime, findFfmpegBinary, requireBinary, resolveYtDlpEngine, runYtDlp, YtDlpError } from './binary.js';
 import { buildDisplayFormats, normalizeYtDlpFormats } from './formats.js';
 /**
+ * Sanitizes stderr text to ensure tokens, signatures, and cookies are never logged.
+ */
+export function sanitizeStderr(stderr) {
+    if (!stderr || typeof stderr !== 'string')
+        return '';
+    return stderr
+        .replace(/(n=|sig=|token=|po_token=|lsig=)[^&\s]+/gi, '$1[REDACTED]')
+        .replace(/--cookies\s+[^\s]+/gi, '--cookies [REDACTED]')
+        .replace(/Cookie:\s*[^\r\n]+/gi, 'Cookie: [REDACTED]')
+        .slice(-1500);
+}
+/**
  * Validates whether a file path exists, is a readable file, non-empty, and has a valid Netscape HTTP Cookie format structure.
  * Never logs cookie contents or sensitive secrets.
  */
@@ -292,14 +304,19 @@ export class YtDlpBaseAdapter {
                 if (err instanceof YtDlpError) {
                     const classified = classifyYtDlpStderr(err.stderrTail, err.timedOut);
                     lastError = classified;
+                    const sanitizedStderr = sanitizeStderr(err.stderrTail);
                     engineLog.warn('yt-dlp metadata extraction strategy failed', {
-                        event: 'yt_dlp_strategy_failed',
+                        event: 'youtube_strategy_failed',
                         platform: this.platform,
-                        binaryPath: binary,
-                        ytDlpVersion: version,
+                        strategy: strategy.name,
                         strategyName: strategy.name,
                         strategyIndex: i + 1,
                         totalStrategies: strategies.length,
+                        binaryPath: binary,
+                        ytDlpVersion: version,
+                        exitCode: err.exitCode ?? 1,
+                        failureStage: 'metadata',
+                        sanitizedStderr,
                         cookiesState: cookiePath ? 'enabled' : 'disabled',
                         classification: classified.code,
                         hostname,
@@ -321,6 +338,7 @@ export class YtDlpBaseAdapter {
                 ytDlpVersion: version,
                 totalStrategiesAttempted: strategies.length,
                 finalClassification: lastError.code,
+                lastSanitizedStderr: sanitizeStderr(stderrTail),
                 hostname,
             });
             throw lastError;

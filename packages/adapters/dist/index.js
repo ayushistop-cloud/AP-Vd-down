@@ -1,5 +1,6 @@
 export * from './contract.js';
 export * from './registry.js';
+export * from './diagnostics.js';
 export * from './youtube.js';
 export * from './tiktok.js';
 export * from './instagram.js';
