@@ -36,23 +36,31 @@ export function normalizeYtDlpFormats(raw, maxHeight) {
             continue;
         const vcodec = f.vcodec ?? 'none';
         const acodec = f.acodec ?? 'none';
-        const hasVideo = vcodec !== 'none';
-        const hasAudio = acodec !== 'none';
+        const hasVideo = vcodec !== 'none' && vcodec !== '';
+        const hasAudio = acodec !== 'none' && acodec !== '';
         if (!hasVideo && !hasAudio)
             continue;
+        const container = (f.ext ?? 'mp4').replace(/[^a-z0-9]/gi, '') || 'mp4';
+        const protocol = f.protocol ?? 'https';
         if (!hasVideo) {
             // audio-only candidate
-            const container = (f.ext ?? 'm4a').replace(/[^a-z0-9]/gi, '') || 'm4a';
             const candidate = {
                 formatId: `a:${f.format_id}`,
                 kind: 'audio',
                 container,
+                extension: container,
+                protocol,
                 label: '',
                 bitrateKbps: Math.round(f.abr ?? f.tbr ?? 0) || undefined,
                 estimatedSizeBytes: f.filesize ?? f.filesize_approx,
+                filesizeApprox: f.filesize_approx,
                 codec: acodec,
+                audioCodec: acodec,
+                hasVideo: false,
+                hasAudio: true,
                 sourceSelector: f.format_id,
                 playable: true,
+                directPlayCompatible: true,
                 mimeType: getMimeType(container, 'audio'),
             };
             if (!bestAudio || (candidate.bitrateKbps ?? 0) > (bestAudio.bitrateKbps ?? 0))
@@ -64,23 +72,31 @@ export function normalizeYtDlpFormats(raw, maxHeight) {
         const normHeight = normalizeHeight(f.height);
         const muxed = hasVideo && hasAudio;
         const kind = muxed ? 'video+audio' : 'video';
-        const container = (f.ext ?? 'mp4').replace(/[^a-z0-9]/gi, '') || 'mp4';
-        const isBrowserCodec = vcodec.includes('avc') || vcodec.includes('h264') || vcodec.includes('vp') || vcodec.includes('av01') || vcodec.includes('mp4v');
-        const isNonBrowserCodec = vcodec.includes('bytevc1') || vcodec.includes('hevc') || vcodec.includes('h265') || vcodec.includes('265');
+        const isBrowserCodec = vcodec.includes('avc') || vcodec.includes('h264') || vcodec.includes('vp8') || vcodec.includes('vp9') || vcodec.includes('mp4v');
+        const isNonBrowserCodec = vcodec.includes('bytevc1') || vcodec.includes('hevc') || vcodec.includes('h265') || vcodec.includes('265') || vcodec.includes('av01') || vcodec.includes('av1');
         const isPlayable = !isNonBrowserCodec && (muxed || isBrowserCodec || container === 'mp4');
+        const directPlayCompatible = muxed && !isNonBrowserCodec && (isBrowserCodec || container === 'mp4' || container === 'webm');
         formats.push({
             formatId: `${muxed ? 'f' : 'v'}:${f.format_id}`,
             kind,
             container,
+            extension: container,
+            protocol,
             label: heightToLabel(normHeight),
             width: f.width,
             height: normHeight,
             fps: f.fps ? Math.round(f.fps) : undefined,
-            codec: hasVideo ? vcodec.split('.')[0] : undefined,
+            codec: vcodec.split('.')[0],
+            videoCodec: vcodec,
+            audioCodec: acodec !== 'none' ? acodec : undefined,
+            hasVideo: true,
+            hasAudio,
             bitrateKbps: Math.round(f.tbr ?? 0) || undefined,
             estimatedSizeBytes: f.filesize ?? f.filesize_approx,
+            filesizeApprox: f.filesize_approx,
             sourceSelector: f.format_id,
             playable: isPlayable,
+            directPlayCompatible,
             mimeType: getMimeType(container, kind),
         });
     }

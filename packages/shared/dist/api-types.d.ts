@@ -12,9 +12,17 @@ export interface ResolveFormatView {
     height?: number;
     fps?: number;
     codec?: string;
+    videoCodec?: string;
+    audioCodec?: string;
+    extension?: string;
+    protocol?: string;
+    hasVideo?: boolean;
+    hasAudio?: boolean;
     bitrateKbps?: number;
     estimatedSizeBytes?: number;
+    filesizeApprox?: number;
     playable?: boolean;
+    directPlayCompatible?: boolean;
     mimeType?: string;
     /** Streaming URL for in-browser playback (requires valid token). */
     streamUrl?: string;
@@ -25,6 +33,10 @@ export interface ResolveItemView {
     durationSeconds?: number;
     thumbnailUrl?: string;
     formats: ResolveFormatView[];
+    downloadFormats?: ResolveFormatView[];
+    playbackCandidates?: ResolveFormatView[];
+    recommendedPlaybackFormat?: ResolveFormatView;
+    playbackFallbackCandidates?: ResolveFormatView[];
     /** Streaming URL for the first playable format (requires valid token). */
     streamUrl?: string;
     /** Direct Play URL alias for immediate playback. */

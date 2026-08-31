@@ -33,8 +33,15 @@ export interface MediaFormat {
     height?: number;
     fps?: number;
     codec?: string;
+    videoCodec?: string;
+    audioCodec?: string;
+    extension?: string;
+    protocol?: string;
+    hasVideo?: boolean;
+    hasAudio?: boolean;
     bitrateKbps?: number;
     estimatedSizeBytes?: number;
+    filesizeApprox?: number;
     /**
      * Opaque adapter-private hint persisted with the resolve result so the
      * worker can act on the exact provider rendition without re-resolving.
@@ -43,6 +50,8 @@ export interface MediaFormat {
     sourceSelector?: string;
     /** Whether this format is playable in-browser (has video+audio or is audio-only with supported codec). */
     playable?: boolean;
+    /** Whether this format is directly playable by browser HTML5 media elements. */
+    directPlayCompatible?: boolean;
     /** MIME type for playback (e.g., video/mp4, audio/mpeg). */
     mimeType?: string;
 }

@@ -766,12 +766,13 @@ export async function buildApp(deps) {
                 success = response.ok || response.status === 206;
                 break;
             }
-            if (!success && record.platform === 'terabox' && attempt === 0) {
-                log.warn('Terabox stream URL returned error or failed redirects, attempting to re-resolve...', {
+            if (!success && attempt === 0) {
+                log.warn('Stream URL returned error or failed redirects, attempting to re-resolve...', {
                     status: response?.status,
+                    platform: record.platform,
                 });
                 attempt++;
-                const adapter = adapters.get('terabox');
+                const adapter = adapters.get(record.platform);
                 if (adapter) {
                     try {
                         const output = await adapter.resolve(item.sourceUrl);
@@ -791,7 +792,7 @@ export async function buildApp(deps) {
                         }
                     }
                     catch (resolveErr) {
-                        log.error('Failed to re-resolve Terabox URL during retry', { error: resolveErr });
+                        log.error('Failed to re-resolve URL during retry', { error: resolveErr, platform: record.platform });
                     }
                 }
             }

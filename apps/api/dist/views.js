@@ -33,10 +33,14 @@ export function resolveRecordToView(record, resolveCtx) {
                 }
                 return view;
             });
-            // Find first playable video MP4 format for item-level streamUrl
-            const playableFormat = publicFormatsList.find((f) => f.playable && f.kind !== 'audio' && f.container?.toLowerCase() === 'mp4') ??
-                publicFormatsList.find((f) => f.playable && f.kind !== 'audio') ??
+            const downloadFormats = [...publicFormatsList];
+            const directCandidates = publicFormatsList.filter((f) => f.directPlayCompatible === true);
+            const fallbackCandidates = publicFormatsList.filter((f) => f.playable && f.kind === 'video+audio');
+            const playbackCandidates = directCandidates.length > 0 ? directCandidates : fallbackCandidates;
+            const recommendedPlaybackFormat = playbackCandidates[0] ??
+                publicFormatsList.find((f) => f.playable && f.kind !== 'audio' && f.container?.toLowerCase() === 'mp4') ??
                 publicFormatsList.find((f) => f.playable);
+            const playbackFallbackCandidates = playbackCandidates.length > 1 ? playbackCandidates.slice(1) : [];
             // Proxy thumbnail for Terabox
             let itemThumb = item.thumbnailUrl;
             if (record.platform === 'terabox' && item.thumbnailUrl && thumbTokenFactory) {
@@ -48,8 +52,12 @@ export function resolveRecordToView(record, resolveCtx) {
                 durationSeconds: item.durationSeconds,
                 thumbnailUrl: itemThumb,
                 formats: publicFormatsList,
-                streamUrl: playableFormat?.streamUrl,
-                playbackUrl: playableFormat?.streamUrl,
+                downloadFormats,
+                playbackCandidates: playbackCandidates.length > 0 ? playbackCandidates : (recommendedPlaybackFormat ? [recommendedPlaybackFormat] : []),
+                recommendedPlaybackFormat,
+                playbackFallbackCandidates,
+                streamUrl: recommendedPlaybackFormat?.streamUrl,
+                playbackUrl: recommendedPlaybackFormat?.streamUrl,
             };
         }),
     };
