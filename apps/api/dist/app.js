@@ -49,10 +49,23 @@ export async function buildApp(deps) {
         reply.header('referrer-policy', 'strict-origin-when-cross-origin');
         reply.header('x-frame-options', 'DENY');
     });
+    const allowedOrigins = config.WEB_ORIGINS.split(',')
+        .map((o) => o.trim().replace(/\/+$/, ''))
+        .filter(Boolean);
     await app.register(cors, {
-        origin: config.WEB_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean),
+        origin: (origin, cb) => {
+            if (!origin)
+                return cb(null, true);
+            const normalizedOrigin = origin.trim().replace(/\/+$/, '');
+            if (allowedOrigins.includes(normalizedOrigin) || allowedOrigins.includes('*')) {
+                return cb(null, true);
+            }
+            return cb(new Error('Not allowed by CORS'), false);
+        },
         credentials: false,
-        methods: ['GET', 'POST'],
+        methods: ['GET', 'POST', 'OPTIONS', 'HEAD'],
+        allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'X-Requested-With', 'Range'],
+        hideOptionsRoute: false,
     });
     app.addHook('onResponse', async (request, reply) => {
         const route = request.routeOptions?.url ?? 'unmatched';

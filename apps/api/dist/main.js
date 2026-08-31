@@ -40,7 +40,7 @@ export async function startApi() {
     if ((config.NODE_ENV === 'production' || config.NODE_ENV === 'staging') && !isEmbeddedMode && !config.REDIS_URL) {
         throw new Error('FATAL: REDIS_URL (Redis queue) is required when DOWNLOAD_EXECUTION_MODE=distributed.');
     }
-    const queue = createQueue(config.REDIS_URL, log.child({ component: 'queue' }), config.WORKER_CONCURRENCY_GLOBAL);
+    const queue = createQueue(isEmbeddedMode ? undefined : config.REDIS_URL, log.child({ component: 'queue' }), config.WORKER_CONCURRENCY_GLOBAL);
     // Operator-facing engine check at boot; requests fail closed with a
     // normalized error until the engine is available.
     await checkEngineAtBoot(log.child({ component: 'engine' }));
@@ -107,8 +107,12 @@ export async function startApi() {
     return { stop };
 }
 // Run directly when executed as a script.
-const isMain = process.argv[1]?.replace(/\\/g, '/').endsWith('/apps/api/dist/main.js') ||
-    process.argv[1]?.replace(/\\/g, '/').endsWith('/apps/api/src/main.ts');
+import { fileURLToPath } from 'node:url';
+const currentFile = fileURLToPath(import.meta.url).replace(/\\/g, '/');
+const execFile = process.argv[1] ? join(process.argv[1]).replace(/\\/g, '/') : '';
+const isMain = execFile.endsWith('/apps/api/dist/main.js') ||
+    execFile.endsWith('/apps/api/src/main.ts') ||
+    (Boolean(execFile) && execFile === currentFile);
 if (isMain) {
     startApi().catch((err) => {
         console.error(JSON.stringify({ event: 'fatal', message: err.message }));
