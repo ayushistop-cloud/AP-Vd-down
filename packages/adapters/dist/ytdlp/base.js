@@ -2,7 +2,7 @@ import { readFileSync, statSync } from 'node:fs';
 import { readdir, rm, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { appErrors, assertPublicHttpUrl, buildFileName, canonicalizeUrl, createLogger, detectPlatform, genericQualityLadder, heightToLabel, MAX_QUALITY_HEIGHT, toAppError, } from '@3ap/shared';
-import { findFfmpegBinary, requireBinary, resolveYtDlpEngine, runYtDlp, YtDlpError } from './binary.js';
+import { detectJsRuntime, findFfmpegBinary, requireBinary, resolveYtDlpEngine, runYtDlp, YtDlpError } from './binary.js';
 import { buildDisplayFormats, normalizeYtDlpFormats } from './formats.js';
 /**
  * Validates whether a file path exists, is a readable file, non-empty, and has a valid Netscape HTTP Cookie format structure.
@@ -88,11 +88,6 @@ function getCookiesArgs() {
 }
 const DEFAULT_SELECTOR = `bv*[height<=${MAX_QUALITY_HEIGHT}]+ba/b[height<=${MAX_QUALITY_HEIGHT}]/bv*+ba/b`;
 const engineLog = createLogger({ service: 'yt-dlp', level: 'error' });
-/**
- * Shared implementation of the adapter contract for all platforms whose
- * extraction is delegated to yt-dlp. Platform subclasses declare identity
- * and capabilities; URL allowlists come from the shared pattern registry.
- */
 export class YtDlpBaseAdapter {
     options;
     constructor(options) {
@@ -108,6 +103,9 @@ export class YtDlpBaseAdapter {
         if (error instanceof YtDlpError)
             return classifyYtDlpStderr(error.stderrTail, error.timedOut);
         return toAppError(error);
+    }
+    getExtractionStrategies() {
+        return [{ name: 'default', args: [] }];
     }
     async resolve(rawUrl) {
         const canonicalUrl = canonicalizeUrl(assertPublicHttpUrl(rawUrl).toString());
@@ -205,88 +203,127 @@ export class YtDlpBaseAdapter {
     }
     getPlatformExtraArgs() {
         const extra = [];
-        if (process.execPath || process.env.PATH) {
+        const jsRuntime = detectJsRuntime();
+        if (jsRuntime.available) {
             extra.push('--js-runtimes', 'node');
         }
         return extra;
     }
     async dumpJson(url, extraArgs, timeoutMs = 45_000) {
         assertPublicHttpUrl(url);
-        const engine = await resolveYtDlpEngine({ ...process.env, ...(process.env.YT_DLP_PATH ? { YT_DLP_PATH: process.env.YT_DLP_PATH } : {}) }).catch(() => null);
-        const binary = engine?.path ?? (await requireBinary(process.env.YT_DLP_PATH, engineLog));
-        const version = engine?.version ?? '2026.08.19';
-        const jsRuntime = engine?.jsRuntime?.name ?? 'node';
-        let stdout = '';
-        let stderrTail = '';
-        let durationMs = 0;
+        const engine = await resolveYtDlpEngine({ ...process.env, ...(process.env.YT_DLP_PATH ? { YT_DLP_PATH: process.env.YT_DLP_PATH } : {}) });
+        const binary = engine.path;
+        const version = engine.version;
+        const jsRuntime = engine.jsRuntime;
         const hostname = new URL(url).hostname;
         const cookiePath = getValidCookiesPath();
         const platformArgs = this.getPlatformExtraArgs();
-        engineLog.info('yt-dlp execution diagnostics', {
-            event: 'yt_dlp_diagnostics',
-            platform: this.platform,
-            ytDlpVersion: version,
-            jsRuntime,
-            cookiesState: cookiePath ? 'enabled' : 'disabled',
-            clientConfig: this.platform === 'youtube' ? 'default' : undefined,
-            hostname,
-        });
-        const runWithFallback = async (argsToRun, allowFallback) => {
+        const strategies = this.getExtractionStrategies();
+        let stdout = '';
+        let stderrTail = '';
+        let durationMs = 0;
+        let lastError = null;
+        for (let i = 0; i < strategies.length; i++) {
+            const strategy = strategies[i];
+            const strategyArgs = [...strategy.args];
+            engineLog.info('yt-dlp metadata extraction attempt', {
+                event: 'yt_dlp_diagnostics',
+                platform: this.platform,
+                binaryPath: binary,
+                ytDlpVersion: version,
+                source: engine.source,
+                jsRuntimeAvailable: jsRuntime.available,
+                jsRuntimeName: jsRuntime.name,
+                strategyName: strategy.name,
+                strategyIndex: i + 1,
+                totalStrategies: strategies.length,
+                cookiesState: cookiePath ? 'enabled' : 'disabled',
+                hostname,
+            });
+            const executeSingleStrategy = async (argsToRun, allowCookieRetry) => {
+                try {
+                    return await runYtDlp(binary, argsToRun, { timeoutMs });
+                }
+                catch (err) {
+                    if (err instanceof YtDlpError) {
+                        stderrTail = err.stderrTail;
+                        const isCookieErr = /does not look like a netscape format cookies file|invalid cookies? file|error loading cookies/i.test(err.stderrTail);
+                        if (isCookieErr && allowCookieRetry && argsToRun.includes('--cookies')) {
+                            engineLog.warn('yt-dlp rejected server cookies configuration; retrying current strategy without cookies', {
+                                platform: this.platform,
+                                strategyName: strategy.name,
+                                hostname,
+                            });
+                            const argsNoCookies = argsToRun.filter((arg, idx) => arg !== '--cookies' && argsToRun[idx - 1] !== '--cookies');
+                            return executeSingleStrategy(argsNoCookies, false);
+                        }
+                    }
+                    throw err;
+                }
+            };
             try {
-                return await runYtDlp(binary, argsToRun, { timeoutMs });
+                const cookieArgs = getCookiesArgs();
+                const fullArgs = [
+                    '--dump-single-json',
+                    '--no-warnings',
+                    '--socket-timeout',
+                    '20',
+                    ...platformArgs,
+                    ...strategyArgs,
+                    ...cookieArgs,
+                    ...extraArgs,
+                    url,
+                ];
+                const res = await executeSingleStrategy(fullArgs, true);
+                stdout = res.stdout;
+                durationMs = res.durationMs;
+                engineLog.info('yt-dlp metadata extraction succeeded', {
+                    event: 'yt_dlp_success',
+                    platform: this.platform,
+                    binaryPath: binary,
+                    ytDlpVersion: version,
+                    strategyName: strategy.name,
+                    durationMs,
+                    hostname,
+                });
+                break;
             }
             catch (err) {
                 if (err instanceof YtDlpError) {
-                    stderrTail = err.stderrTail;
-                    const isCookieErr = /does not look like a netscape format cookies file|invalid cookies? file|error loading cookies/i.test(err.stderrTail);
-                    if (isCookieErr && argsToRun.includes('--cookies')) {
-                        engineLog.warn('yt-dlp rejected server cookies configuration; retrying request without cookies', {
-                            platform: this.platform,
-                            hostname,
-                        });
-                        const argsNoCookies = argsToRun.filter((arg, idx) => arg !== '--cookies' && argsToRun[idx - 1] !== '--cookies');
-                        return runWithFallback(argsNoCookies, false);
-                    }
-                    const isVerification = /sign in to confirm you['’]?re not a bot|confirm you['’]?re not a bot|sign in to confirm|confirm your age|\bpo_token\b|\bpo token\b|bot detection|bot verification|captcha/i.test(err.stderrTail);
-                    if (allowFallback && this.platform === 'youtube' && (isVerification || /http error 403|403 forbidden/i.test(err.stderrTail))) {
-                        engineLog.info('YouTube extraction encountered provider verification; attempting safe fallback client configuration', {
-                            platform: this.platform,
-                            hostname,
-                            fallbackClient: 'mweb,web',
-                        });
-                        const fallbackArgs = [
-                            '--extractor-args',
-                            'youtube:player_client=mweb,web',
-                            ...argsToRun.filter((a) => a !== '--extractor-args' && !a.startsWith('youtube:player_client')),
-                        ];
-                        return runWithFallback(fallbackArgs, false);
+                    const classified = classifyYtDlpStderr(err.stderrTail, err.timedOut);
+                    lastError = classified;
+                    engineLog.warn('yt-dlp metadata extraction strategy failed', {
+                        event: 'yt_dlp_strategy_failed',
+                        platform: this.platform,
+                        binaryPath: binary,
+                        ytDlpVersion: version,
+                        strategyName: strategy.name,
+                        strategyIndex: i + 1,
+                        totalStrategies: strategies.length,
+                        cookiesState: cookiePath ? 'enabled' : 'disabled',
+                        classification: classified.code,
+                        hostname,
+                    });
+                    if (classified.code === 'INVALID_URL' || classified.code === 'UNSUPPORTED' || classified.code === 'NOT_PUBLIC') {
+                        throw classified;
                     }
                 }
-                throw err;
+                else {
+                    throw toAppError(err);
+                }
             }
-        };
-        try {
-            const cookieArgs = getCookiesArgs();
-            const initialArgs = ['--dump-single-json', '--no-warnings', '--socket-timeout', '20', ...platformArgs, ...cookieArgs, ...extraArgs, url];
-            const res = await runWithFallback(initialArgs, true);
-            stdout = res.stdout;
-            durationMs = res.durationMs;
         }
-        catch (err) {
-            if (err instanceof YtDlpError) {
-                const classified = classifyYtDlpStderr(err.stderrTail, err.timedOut);
-                engineLog.warn('yt-dlp metadata request failed', {
-                    event: 'yt_dlp_failed',
-                    platform: this.platform,
-                    hostname,
-                    ytDlpVersion: version,
-                    jsRuntime,
-                    cookiesState: cookiePath ? 'enabled' : 'disabled',
-                    classification: classified.code,
-                });
-                throw classified;
-            }
-            throw toAppError(err);
+        if (!stdout && lastError) {
+            engineLog.error('All yt-dlp extraction strategies failed', {
+                event: 'yt_dlp_all_strategies_failed',
+                platform: this.platform,
+                binaryPath: binary,
+                ytDlpVersion: version,
+                totalStrategiesAttempted: strategies.length,
+                finalClassification: lastError.code,
+                hostname,
+            });
+            throw lastError;
         }
         const trimmed = stdout.trim();
         if (!trimmed) {
@@ -361,22 +398,10 @@ export class YtDlpBaseAdapter {
         assertPublicHttpUrl(request.sourceUrl);
         const selection = selectSelector(request);
         const platformArgs = this.getPlatformExtraArgs();
-        const args = [...buildBaseArgs(request.maxFileSizeBytes), ...platformArgs];
-        if (selection.audioOnly) {
-            args.push('--format', selection.selector ?? 'bestaudio[ext=m4a]/bestaudio');
-            const ffmpeg = await findFfmpegBinary(process.env.FFMPEG_PATH);
-            if (ffmpeg) {
-                args.push('--ffmpeg-location', ffmpeg, '-x', '--audio-format', 'mp3', '--audio-quality', '0');
-            }
-        }
-        else {
-            args.push('--format', selection.selector ?? DEFAULT_SELECTOR);
-        }
-        // Absolute paths are mandatory here: yt-dlp resolves --output against its
-        // own cwd, and mixing two relative bases silently misplaces artifacts.
+        const strategies = this.getExtractionStrategies();
         const absWorkDir = resolve(ctx.workDir);
-        args.push('--output', join(absWorkDir, '%(id)s.%(ext)s'));
-        args.push(request.sourceUrl);
+        let downloaded = false;
+        let lastError = null;
         let lastEmit = 0;
         let stage = 'connecting';
         const onLine = (line) => {
@@ -398,57 +423,71 @@ export class YtDlpBaseAdapter {
                 }
             }
         };
-        const runDownloadWithFallback = async (argsToRun, allowFallback) => {
+        for (let i = 0; i < strategies.length; i++) {
+            const strategy = strategies[i];
+            const strategyArgs = [...strategy.args];
+            const fullArgs = [...buildBaseArgs(request.maxFileSizeBytes), ...platformArgs, ...strategyArgs];
+            if (selection.audioOnly) {
+                fullArgs.push('--format', selection.selector ?? 'bestaudio[ext=m4a]/bestaudio');
+                const ffmpeg = await findFfmpegBinary(process.env.FFMPEG_PATH);
+                if (ffmpeg) {
+                    fullArgs.push('--ffmpeg-location', ffmpeg, '-x', '--audio-format', 'mp3', '--audio-quality', '0');
+                }
+            }
+            else {
+                fullArgs.push('--format', selection.selector ?? DEFAULT_SELECTOR);
+            }
+            fullArgs.push('--output', join(absWorkDir, '%(id)s.%(ext)s'));
+            fullArgs.push(request.sourceUrl);
+            const executeSingleDownload = async (argsToRun, allowCookieRetry) => {
+                try {
+                    await runYtDlp(binary, argsToRun, {
+                        timeoutMs: 15 * 60 * 1000,
+                        abort: ctx.signal,
+                        cwd: absWorkDir,
+                        onStdoutLine: onLine,
+                        onStderrLine: (line) => ctx.log.debug('yt-dlp stderr', { line: line.trim().slice(0, 300) }),
+                    });
+                }
+                catch (err) {
+                    if (err instanceof YtDlpError) {
+                        const isCookieErr = /does not look like a netscape format cookies file|invalid cookies? file|error loading cookies/i.test(err.stderrTail);
+                        if (isCookieErr && allowCookieRetry && argsToRun.includes('--cookies')) {
+                            ctx.log.warn('yt-dlp rejected cookie file during download; retrying current strategy without cookies');
+                            const argsNoCookies = argsToRun.filter((arg, idx) => arg !== '--cookies' && argsToRun[idx - 1] !== '--cookies');
+                            return executeSingleDownload(argsNoCookies, false);
+                        }
+                    }
+                    throw err;
+                }
+            };
             try {
-                await runYtDlp(binary, argsToRun, {
-                    timeoutMs: 15 * 60 * 1000,
-                    abort: ctx.signal,
-                    cwd: absWorkDir,
-                    onStdoutLine: onLine,
-                    onStderrLine: (line) => ctx.log.debug('yt-dlp stderr', { line: line.trim().slice(0, 300) }),
-                });
+                await executeSingleDownload(fullArgs, true);
+                downloaded = true;
+                break;
             }
             catch (err) {
                 if (err instanceof YtDlpError) {
-                    const isCookieErr = /does not look like a netscape format cookies file|invalid cookies? file|error loading cookies/i.test(err.stderrTail);
-                    if (isCookieErr && argsToRun.includes('--cookies')) {
-                        ctx.log.warn('yt-dlp rejected cookie file during download; retrying without cookies');
-                        const argsNoCookies = argsToRun.filter((arg, idx) => arg !== '--cookies' && argsToRun[idx - 1] !== '--cookies');
-                        return runDownloadWithFallback(argsNoCookies, false);
-                    }
-                    const isVerification = /sign in to confirm you['’]?re not a bot|confirm you['’]?re not a bot|sign in to confirm|confirm your age|\bpo_token\b|\bpo token\b|bot detection|bot verification|captcha/i.test(err.stderrTail);
-                    if (allowFallback && this.platform === 'youtube' && (isVerification || /http error 403|403 forbidden/i.test(err.stderrTail))) {
-                        ctx.log.info('YouTube download encountered provider verification; attempting safe fallback client configuration');
-                        const fallbackArgs = [
-                            '--extractor-args',
-                            'youtube:player_client=mweb,web',
-                            ...argsToRun,
-                        ];
-                        return runDownloadWithFallback(fallbackArgs, false);
+                    const classified = classifyYtDlpStderr(err.stderrTail, err.timedOut);
+                    lastError = classified;
+                    ctx.log.warn('yt-dlp download strategy failed', {
+                        platform: this.platform,
+                        strategyName: strategy.name,
+                        strategyIndex: i + 1,
+                        totalStrategies: strategies.length,
+                        classification: classified.code,
+                    });
+                    if (classified.code === 'INVALID_URL' || classified.code === 'UNSUPPORTED' || classified.code === 'NOT_PUBLIC') {
+                        throw classified;
                     }
                 }
-                throw err;
+                else {
+                    throw toAppError(err);
+                }
             }
-        };
-        try {
-            await runDownloadWithFallback(args, true);
         }
-        catch (err) {
-            if (err instanceof YtDlpError) {
-                const classified = classifyYtDlpStderr(err.stderrTail, err.timedOut);
-                ctx.log.error('yt-dlp download failed', {
-                    event: 'yt_dlp_download_failed',
-                    platform: this.platform,
-                    exitCode: err.exitCode,
-                    timedOut: err.timedOut,
-                    stderrTail: err.stderrTail.slice(-4000),
-                    classifiedCode: classified.code,
-                });
-                throw classified;
-            }
-            else {
-                throw toAppError(err);
-            }
+        if (!downloaded && lastError) {
+            throw lastError;
         }
         const produced = await collectProducedFile(ctx.workDir);
         if (!produced) {

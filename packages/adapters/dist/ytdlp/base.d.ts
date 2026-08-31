@@ -19,6 +19,10 @@ export interface YtDlpPlatformOptions {
  * extraction is delegated to yt-dlp. Platform subclasses declare identity
  * and capabilities; URL allowlists come from the shared pattern registry.
  */
+export interface YtDlpExtractionStrategy {
+    name: string;
+    args: string[];
+}
 export declare abstract class YtDlpBaseAdapter implements MediaAdapter {
     protected readonly options: YtDlpPlatformOptions;
     abstract readonly platform: MediaAdapter['platform'];
@@ -26,6 +30,7 @@ export declare abstract class YtDlpBaseAdapter implements MediaAdapter {
     getCapabilities(): AdapterCapabilities;
     canHandle(url: string): boolean;
     normalizeError(error: unknown): AppError;
+    protected getExtractionStrategies(): YtDlpExtractionStrategy[];
     resolve(rawUrl: string): Promise<ResolveOutput>;
     private resolvePlaylist;
     private resolveSingleOrCollection;
