@@ -3,6 +3,12 @@ import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { appErrors } from '@3ap/shared';
+export function detectJsRuntime() {
+    if (process.execPath) {
+        return { name: 'node', available: true, path: process.execPath };
+    }
+    return { name: 'none', available: false };
+}
 export class EngineUnavailableError extends Error {
     checked;
     constructor(message, checked) {
@@ -173,7 +179,7 @@ export async function resolveYtDlpEngine(env = process.env, options = {}) {
             problems.push(`not a yt-dlp executable: ${path} (reported "${probe.version.slice(0, 60)}")`);
             continue;
         }
-        const resolution = { path, version: probe.version, source };
+        const resolution = { path, version: probe.version, source, jsRuntime: detectJsRuntime() };
         cache.set(cacheKey, resolution);
         return resolution;
     }
@@ -192,7 +198,7 @@ export async function resolveYtDlpEngine(env = process.env, options = {}) {
 export async function requireBinary(configuredPath, log) {
     try {
         const engine = await resolveYtDlpEngine({ ...process.env, ...(configuredPath ? { YT_DLP_PATH: configuredPath } : {}) });
-        log.info('download engine ready', { version: engine.version, source: engine.source });
+        log.info('download engine ready', { version: engine.version, source: engine.source, jsRuntime: engine.jsRuntime.name });
         return engine.path;
     }
     catch (err) {
@@ -207,7 +213,7 @@ export async function requireBinary(configuredPath, log) {
 export async function checkEngineAtBoot(log) {
     try {
         const engine = await resolveYtDlpEngine();
-        log.info('download engine available', { version: engine.version, source: engine.source });
+        log.info('download engine available', { version: engine.version, source: engine.source, jsRuntime: engine.jsRuntime.name });
     }
     catch (err) {
         if (err instanceof EngineUnavailableError) {

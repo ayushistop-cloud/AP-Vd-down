@@ -2,7 +2,7 @@ import { readFileSync, statSync } from 'node:fs';
 import { readdir, rm, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { appErrors, assertPublicHttpUrl, buildFileName, canonicalizeUrl, createLogger, detectPlatform, genericQualityLadder, heightToLabel, MAX_QUALITY_HEIGHT, toAppError, } from '@3ap/shared';
-import { findFfmpegBinary, requireBinary, runYtDlp, YtDlpError } from './binary.js';
+import { findFfmpegBinary, requireBinary, resolveYtDlpEngine, runYtDlp, YtDlpError } from './binary.js';
 import { buildDisplayFormats, normalizeYtDlpFormats } from './formats.js';
 /**
  * Validates whether a file path exists, is a readable file, non-empty, and has a valid Netscape HTTP Cookie format structure.
@@ -200,16 +200,37 @@ export class YtDlpBaseAdapter {
             capabilities: this.options.capabilities,
         };
     }
+    getPlatformExtraArgs() {
+        const extra = [];
+        if (process.execPath || process.env.PATH) {
+            extra.push('--js-runtimes', 'node');
+        }
+        return extra;
+    }
     async dumpJson(url, extraArgs, timeoutMs = 45_000) {
         assertPublicHttpUrl(url);
-        const binary = await requireBinary(process.env.YT_DLP_PATH, engineLog);
+        const engine = await resolveYtDlpEngine({ ...process.env, ...(process.env.YT_DLP_PATH ? { YT_DLP_PATH: process.env.YT_DLP_PATH } : {}) }).catch(() => null);
+        const binary = engine?.path ?? (await requireBinary(process.env.YT_DLP_PATH, engineLog));
+        const version = engine?.version ?? '2026.08.19';
+        const jsRuntime = engine?.jsRuntime?.name ?? 'node';
         let stdout = '';
         let stderrTail = '';
         let durationMs = 0;
         const hostname = new URL(url).hostname;
+        const cookiePath = getValidCookiesPath();
+        const platformArgs = this.getPlatformExtraArgs();
+        engineLog.info('yt-dlp execution diagnostics', {
+            event: 'yt_dlp_diagnostics',
+            platform: this.platform,
+            ytDlpVersion: version,
+            jsRuntime,
+            cookiesState: cookiePath ? 'enabled' : 'disabled',
+            clientConfig: this.platform === 'youtube' ? 'default' : undefined,
+            hostname,
+        });
         try {
             const cookieArgs = getCookiesArgs();
-            const res = await runYtDlp(binary, ['--dump-single-json', '--no-warnings', '--socket-timeout', '20', ...cookieArgs, ...extraArgs, url], { timeoutMs });
+            const res = await runYtDlp(binary, ['--dump-single-json', '--no-warnings', '--socket-timeout', '20', ...platformArgs, ...cookieArgs, ...extraArgs, url], { timeoutMs });
             stdout = res.stdout;
             durationMs = res.durationMs;
         }
@@ -221,13 +242,23 @@ export class YtDlpBaseAdapter {
                         hostname,
                     });
                     try {
-                        const retryRes = await runYtDlp(binary, ['--dump-single-json', '--no-warnings', '--socket-timeout', '20', ...extraArgs, url], { timeoutMs });
+                        const retryRes = await runYtDlp(binary, ['--dump-single-json', '--no-warnings', '--socket-timeout', '20', ...platformArgs, ...extraArgs, url], { timeoutMs });
                         stdout = retryRes.stdout;
                         durationMs = retryRes.durationMs;
                     }
                     catch (retryErr) {
                         if (retryErr instanceof YtDlpError) {
-                            throw classifyYtDlpStderr(retryErr.stderrTail, retryErr.timedOut);
+                            const classified = classifyYtDlpStderr(retryErr.stderrTail, retryErr.timedOut);
+                            engineLog.warn('yt-dlp metadata request failed', {
+                                event: 'yt_dlp_failed',
+                                platform: this.platform,
+                                hostname,
+                                ytDlpVersion: version,
+                                jsRuntime,
+                                cookiesState: 'disabled',
+                                classification: classified.code,
+                            });
+                            throw classified;
                         }
                         throw toAppError(retryErr);
                     }
@@ -235,15 +266,13 @@ export class YtDlpBaseAdapter {
                 else {
                     stderrTail = err.stderrTail;
                     const classified = classifyYtDlpStderr(err.stderrTail, err.timedOut);
-                    engineLog.error('yt-dlp execution failed', {
+                    engineLog.warn('yt-dlp metadata request failed', {
                         event: 'yt_dlp_failed',
                         platform: this.platform,
                         hostname,
-                        exitCode: err.exitCode,
-                        timedOut: err.timedOut,
-                        stdoutBytes: 0,
-                        stderrBytes: err.stderrTail.length,
-                        sanitizedStderrTail: err.stderrTail.slice(-2000),
+                        ytDlpVersion: version,
+                        jsRuntime,
+                        cookiesState: cookiePath ? 'enabled' : 'disabled',
                         classification: classified.code,
                     });
                     throw classified;
@@ -325,7 +354,8 @@ export class YtDlpBaseAdapter {
         const binary = await requireBinary(process.env.YT_DLP_PATH, ctx.log);
         assertPublicHttpUrl(request.sourceUrl);
         const selection = selectSelector(request);
-        const args = buildBaseArgs(request.maxFileSizeBytes);
+        const platformArgs = this.getPlatformExtraArgs();
+        const args = [...buildBaseArgs(request.maxFileSizeBytes), ...platformArgs];
         if (selection.audioOnly) {
             args.push('--format', selection.selector ?? 'bestaudio[ext=m4a]/bestaudio');
             const ffmpeg = await findFfmpegBinary(process.env.FFMPEG_PATH);
@@ -535,7 +565,7 @@ export function classifyYtDlpStderr(stderrTail, timedOut) {
     }
     // 2. Explicit YouTube Bot / Verification / Challenge / Age check / PO Token
     if (/sign in to confirm you['’]?re not a bot|confirm you['’]?re not a bot|sign in to confirm|confirm your age|\bpo_token\b|\bpo token\b|n-sig extraction failed|nsig extraction failed|signature extraction failed|bot detection|bot verification|captcha/i.test(text)) {
-        return appErrors.platformVerification('Platform verification is currently required by the provider. Please try again later.');
+        return appErrors.platformVerification('YouTube currently requires provider verification. Please try again later or supply valid cookies.');
     }
     // 3. HTTP 403 Forbidden
     if (/http error 403|403 forbidden/i.test(text)) {
