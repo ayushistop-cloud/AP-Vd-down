@@ -26,9 +26,6 @@ export class YouTubeAdapter extends YtDlpBaseAdapter {
         return [
             { name: 'youtube_default', args: [] },
             { name: 'youtube_mweb', args: ['--extractor-args', 'youtube:player_client=mweb,web'] },
-            { name: 'youtube_web_safari', args: ['--extractor-args', 'youtube:player_client=web_safari,web'] },
-            { name: 'youtube_android', args: ['--extractor-args', 'youtube:player_client=android,web'] },
-            { name: 'youtube_tv_embedded', args: ['--extractor-args', 'youtube:player_client=tv_embedded,web_embedded'] },
         ];
     }
 }
