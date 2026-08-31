@@ -1,8 +1,20 @@
+import { existsSync } from 'node:fs';
 import { readdir, rm, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { appErrors, assertPublicHttpUrl, buildFileName, canonicalizeUrl, createLogger, detectPlatform, genericQualityLadder, heightToLabel, MAX_QUALITY_HEIGHT, toAppError, } from '@3ap/shared';
 import { findFfmpegBinary, requireBinary, runYtDlp, YtDlpError } from './binary.js';
 import { buildDisplayFormats, normalizeYtDlpFormats } from './formats.js';
+function getCookiesArgs() {
+    const customPath = process.env.YTDLP_COOKIES_PATH || process.env.COOKIES_FILE;
+    if (customPath && existsSync(customPath)) {
+        return ['--cookies', customPath];
+    }
+    const renderSecretsPath = '/etc/secrets/cookies.txt';
+    if (existsSync(renderSecretsPath)) {
+        return ['--cookies', renderSecretsPath];
+    }
+    return [];
+}
 const DEFAULT_SELECTOR = `bv*[height<=${MAX_QUALITY_HEIGHT}]+ba/b[height<=${MAX_QUALITY_HEIGHT}]/bv*+ba/b`;
 const engineLog = createLogger({ service: 'yt-dlp', level: 'error' });
 /**
@@ -128,7 +140,8 @@ export class YtDlpBaseAdapter {
         let durationMs = 0;
         const hostname = new URL(url).hostname;
         try {
-            const res = await runYtDlp(binary, ['--dump-single-json', '--no-warnings', '--socket-timeout', '20', ...extraArgs, url], { timeoutMs });
+            const cookieArgs = getCookiesArgs();
+            const res = await runYtDlp(binary, ['--dump-single-json', '--no-warnings', '--socket-timeout', '20', ...cookieArgs, ...extraArgs, url], { timeoutMs });
             stdout = res.stdout;
             durationMs = res.durationMs;
         }
@@ -341,6 +354,7 @@ export function selectSelector(request) {
     return { selector: DEFAULT_SELECTOR, audioOnly: false };
 }
 function buildBaseArgs(maxFileSizeBytes) {
+    const cookieArgs = getCookiesArgs();
     return [
         '--no-warnings',
         '--newline',
@@ -356,6 +370,7 @@ function buildBaseArgs(maxFileSizeBytes) {
         '4',
         '--max-filesize',
         String(maxFileSizeBytes),
+        ...cookieArgs,
     ];
 }
 async function collectProducedFile(workDir) {

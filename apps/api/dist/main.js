@@ -59,20 +59,21 @@ export async function startApi() {
     }
     const app = await buildApp({ config, store, adapters, queue, log, metrics });
     const listenHost = config.NODE_ENV === 'production' || config.NODE_ENV === 'staging' ? '0.0.0.0' : config.API_HOST;
+    const port = process.env.PORT ? Number.parseInt(process.env.PORT, 10) : config.API_PORT;
     try {
-        await app.listen({ port: config.API_PORT, host: listenHost });
+        await app.listen({ port, host: listenHost });
     }
     catch (err) {
         if (err?.code === 'EADDRINUSE') {
-            log.info(`API backend is already running on http://${listenHost}:${config.API_PORT}`);
+            log.info(`API backend is already running on http://${listenHost}:${port}`);
             return { stop: async () => { } };
         }
-        log.error('failed to bind API port', { port: config.API_PORT, host: listenHost, message: err.message });
+        log.error('failed to bind API port', { port, host: listenHost, message: err.message });
         throw err;
     }
     log.info('api listening', {
         host: listenHost,
-        port: config.API_PORT,
+        port,
         env: config.NODE_ENV,
         executionMode: config.DOWNLOAD_EXECUTION_MODE,
         routes: [
