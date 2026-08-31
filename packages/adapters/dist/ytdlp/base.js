@@ -1,20 +1,85 @@
-import { existsSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { readdir, rm, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { appErrors, assertPublicHttpUrl, buildFileName, canonicalizeUrl, createLogger, detectPlatform, genericQualityLadder, heightToLabel, MAX_QUALITY_HEIGHT, toAppError, } from '@3ap/shared';
 import { findFfmpegBinary, requireBinary, runYtDlp, YtDlpError } from './binary.js';
 import { buildDisplayFormats, normalizeYtDlpFormats } from './formats.js';
-function getCookiesArgs() {
-    const customPath = process.env.YTDLP_COOKIES_PATH ||
-        process.env.COOKIES_PATH ||
-        process.env.YTDLP_COOKIES ||
-        process.env.COOKIES_FILE;
-    if (customPath && existsSync(customPath)) {
-        return ['--cookies', customPath];
+/**
+ * Validates whether a file path exists, is a readable file, non-empty, and has a valid Netscape HTTP Cookie format structure.
+ * Never logs cookie contents or sensitive secrets.
+ */
+export function isValidNetscapeCookieFile(filePath) {
+    if (!filePath || typeof filePath !== 'string')
+        return false;
+    try {
+        const stats = statSync(filePath);
+        if (!stats.isFile() || stats.size === 0) {
+            return false;
+        }
+        // Prevent reading arbitrarily huge non-cookie files (10MB limit)
+        if (stats.size > 10 * 1024 * 1024) {
+            return false;
+        }
+        const content = readFileSync(filePath, 'utf8');
+        const trimmed = content.trim();
+        if (!trimmed)
+            return false;
+        const lines = trimmed.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+        if (lines.length === 0)
+            return false;
+        // Check 1: Standard Netscape cookie header comment
+        const hasHeader = lines.some((line) => /^#\s*(Netscape HTTP Cookie File|HTTP Cookie File|curl cookie file)/i.test(line));
+        // Check 2: Valid tab-separated cookie line (domain \t flag \t path \t secure \t expiration \t name \t value)
+        const hasValidCookieLine = lines.some((line) => {
+            if (line.startsWith('#'))
+                return false;
+            const fields = line.split('\t');
+            if (fields.length >= 6) {
+                const flag = fields[1]?.trim().toUpperCase();
+                const secure = fields[3]?.trim().toUpperCase();
+                if ((flag === 'TRUE' || flag === 'FALSE') && (secure === 'TRUE' || secure === 'FALSE')) {
+                    return true;
+                }
+                if (fields.length >= 7)
+                    return true;
+            }
+            return false;
+        });
+        return hasHeader || hasValidCookieLine;
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * Resolves a valid Netscape cookie file path from env vars or standard Render secret location.
+ * Returns undefined if missing, empty, malformed, or unreadable.
+ */
+export function getValidCookiesPath() {
+    const envCandidates = [
+        process.env.YTDLP_COOKIES_PATH,
+        process.env.COOKIES_PATH,
+        process.env.YTDLP_COOKIES,
+        process.env.COOKIES_FILE,
+    ];
+    for (const cand of envCandidates) {
+        if (cand && cand.trim()) {
+            const trimmed = cand.trim();
+            if (isValidNetscapeCookieFile(trimmed)) {
+                return trimmed;
+            }
+        }
     }
     const renderSecretsPath = '/etc/secrets/cookies.txt';
-    if (existsSync(renderSecretsPath)) {
-        return ['--cookies', renderSecretsPath];
+    if (isValidNetscapeCookieFile(renderSecretsPath)) {
+        return renderSecretsPath;
+    }
+    return undefined;
+}
+function getCookiesArgs() {
+    const validPath = getValidCookiesPath();
+    if (validPath) {
+        return ['--cookies', validPath];
     }
     return [];
 }
@@ -150,22 +215,43 @@ export class YtDlpBaseAdapter {
         }
         catch (err) {
             if (err instanceof YtDlpError) {
-                stderrTail = err.stderrTail;
-                const classified = classifyYtDlpStderr(err.stderrTail, err.timedOut);
-                engineLog.error('yt-dlp execution failed', {
-                    event: 'yt_dlp_failed',
-                    platform: this.platform,
-                    hostname,
-                    exitCode: err.exitCode,
-                    timedOut: err.timedOut,
-                    stdoutBytes: 0,
-                    stderrBytes: err.stderrTail.length,
-                    sanitizedStderrTail: err.stderrTail.slice(-2000),
-                    classification: classified.code,
-                });
-                throw classified;
+                if (/does not look like a netscape format cookies file|invalid cookies? file|error loading cookies/i.test(err.stderrTail)) {
+                    engineLog.warn('yt-dlp rejected server cookies configuration; retrying request without cookies', {
+                        platform: this.platform,
+                        hostname,
+                    });
+                    try {
+                        const retryRes = await runYtDlp(binary, ['--dump-single-json', '--no-warnings', '--socket-timeout', '20', ...extraArgs, url], { timeoutMs });
+                        stdout = retryRes.stdout;
+                        durationMs = retryRes.durationMs;
+                    }
+                    catch (retryErr) {
+                        if (retryErr instanceof YtDlpError) {
+                            throw classifyYtDlpStderr(retryErr.stderrTail, retryErr.timedOut);
+                        }
+                        throw toAppError(retryErr);
+                    }
+                }
+                else {
+                    stderrTail = err.stderrTail;
+                    const classified = classifyYtDlpStderr(err.stderrTail, err.timedOut);
+                    engineLog.error('yt-dlp execution failed', {
+                        event: 'yt_dlp_failed',
+                        platform: this.platform,
+                        hostname,
+                        exitCode: err.exitCode,
+                        timedOut: err.timedOut,
+                        stdoutBytes: 0,
+                        stderrBytes: err.stderrTail.length,
+                        sanitizedStderrTail: err.stderrTail.slice(-2000),
+                        classification: classified.code,
+                    });
+                    throw classified;
+                }
             }
-            throw toAppError(err);
+            else {
+                throw toAppError(err);
+            }
         }
         const trimmed = stdout.trim();
         if (!trimmed) {
@@ -287,18 +373,50 @@ export class YtDlpBaseAdapter {
         }
         catch (err) {
             if (err instanceof YtDlpError) {
-                const classified = classifyYtDlpStderr(err.stderrTail, err.timedOut);
-                ctx.log.error('yt-dlp download failed', {
-                    event: 'yt_dlp_download_failed',
-                    platform: this.platform,
-                    exitCode: err.exitCode,
-                    timedOut: err.timedOut,
-                    stderrTail: err.stderrTail.slice(-4000),
-                    classifiedCode: classified.code,
-                });
-                throw classified;
+                if (/does not look like a netscape format cookies file|invalid cookies? file|error loading cookies/i.test(err.stderrTail)) {
+                    ctx.log.warn('yt-dlp rejected cookie file during download; retrying without cookies');
+                    const argsNoCookies = args.filter((arg, idx) => arg !== '--cookies' && args[idx - 1] !== '--cookies');
+                    try {
+                        await runYtDlp(binary, argsNoCookies, {
+                            timeoutMs: 15 * 60 * 1000,
+                            abort: ctx.signal,
+                            cwd: absWorkDir,
+                            onStdoutLine: onLine,
+                            onStderrLine: (line) => ctx.log.debug('yt-dlp stderr', { line: line.trim().slice(0, 300) }),
+                        });
+                    }
+                    catch (retryErr) {
+                        if (retryErr instanceof YtDlpError) {
+                            const classified = classifyYtDlpStderr(retryErr.stderrTail, retryErr.timedOut);
+                            ctx.log.error('yt-dlp download failed', {
+                                event: 'yt_dlp_download_failed',
+                                platform: this.platform,
+                                exitCode: retryErr.exitCode,
+                                timedOut: retryErr.timedOut,
+                                stderrTail: retryErr.stderrTail.slice(-4000),
+                                classifiedCode: classified.code,
+                            });
+                            throw classified;
+                        }
+                        throw toAppError(retryErr);
+                    }
+                }
+                else {
+                    const classified = classifyYtDlpStderr(err.stderrTail, err.timedOut);
+                    ctx.log.error('yt-dlp download failed', {
+                        event: 'yt_dlp_download_failed',
+                        platform: this.platform,
+                        exitCode: err.exitCode,
+                        timedOut: err.timedOut,
+                        stderrTail: err.stderrTail.slice(-4000),
+                        classifiedCode: classified.code,
+                    });
+                    throw classified;
+                }
             }
-            throw toAppError(err);
+            else {
+                throw toAppError(err);
+            }
         }
         const produced = await collectProducedFile(ctx.workDir);
         if (!produced) {
@@ -407,6 +525,10 @@ export function classifyYtDlpStderr(stderrTail, timedOut) {
     const text = stderrTail.toLowerCase();
     if (timedOut)
         return appErrors.temporaryProviderError('Processing took too long and was stopped.');
+    // Cookie configuration error classification
+    if (/does not look like a netscape format cookies file|invalid cookies? file|error loading cookies/i.test(text)) {
+        return appErrors.temporaryProviderError('Media service encountered an invalid server cookies configuration. Please retry.');
+    }
     // 1. Genuine private / login-gated content
     if (/\bprivate video\b|\bmembers-only\b|\bjoin this channel to get access\b|\bthis video is private\b|\baccount is private\b|\bthis content is private\b/i.test(text)) {
         return appErrors.notPublic();

@@ -7,6 +7,7 @@ export * from './facebook.js';
 export * from './terabox.js';
 export * from './http-download.js';
 export { checkEngineAtBoot, resolveYtDlpEngine, resetBinaryCache, EngineUnavailableError, requireBinary, runYtDlp, } from './ytdlp/binary.js';
+export { isValidNetscapeCookieFile, getValidCookiesPath } from './ytdlp/base.js';
 import { FacebookAdapter } from './facebook.js';
 import { InstagramAdapter } from './instagram.js';
 import { TikTokAdapter } from './tiktok.js';
