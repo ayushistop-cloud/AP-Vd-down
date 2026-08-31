@@ -5,7 +5,10 @@ import { appErrors, assertPublicHttpUrl, buildFileName, canonicalizeUrl, createL
 import { findFfmpegBinary, requireBinary, runYtDlp, YtDlpError } from './binary.js';
 import { buildDisplayFormats, normalizeYtDlpFormats } from './formats.js';
 function getCookiesArgs() {
-    const customPath = process.env.YTDLP_COOKIES_PATH || process.env.COOKIES_FILE;
+    const customPath = process.env.YTDLP_COOKIES_PATH ||
+        process.env.COOKIES_PATH ||
+        process.env.YTDLP_COOKIES ||
+        process.env.COOKIES_FILE;
     if (customPath && existsSync(customPath)) {
         return ['--cookies', customPath];
     }
