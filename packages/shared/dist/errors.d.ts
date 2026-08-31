@@ -19,7 +19,7 @@ export declare class AppError extends Error {
     get httpStatus(): number;
     toJSON(): {
         details?: Record<string, unknown> | undefined;
-        code: "INVALID_URL" | "UNSUPPORTED" | "NOT_PUBLIC" | "RATE_LIMITED" | "TOO_LARGE" | "PLAYLIST_LIMIT" | "TEMPORARY_PROVIDER_ERROR" | "PROCESSING_FAILED" | "CANCELLED" | "EXPIRED" | "PLATFORM_VERIFICATION" | "YOUTUBE_EXTRACTOR_ERROR" | "NETWORK_ERROR" | "ENGINE_ERROR" | "ENGINE_OUTPUT_EMPTY" | "ENGINE_OUTPUT_INVALID" | "NOT_FOUND" | "VALIDATION_ERROR" | "CONFLICT" | "INTERNAL" | "DOWNLOAD_ENGINE_UNAVAILABLE";
+        code: "INVALID_URL" | "UNSUPPORTED" | "NOT_PUBLIC" | "RATE_LIMITED" | "TOO_LARGE" | "PLAYLIST_LIMIT" | "TEMPORARY_PROVIDER_ERROR" | "PROCESSING_FAILED" | "CANCELLED" | "EXPIRED" | "PLATFORM_VERIFICATION" | "YOUTUBE_EXTRACTOR_ERROR" | "YOUTUBE_METADATA_ACCESS_FAILED" | "YOUTUBE_FORMAT_ACCESS_FAILED" | "YOUTUBE_STREAM_ACCESS_FAILED" | "YOUTUBE_AUTH_REQUIRED" | "NETWORK_ERROR" | "ENGINE_ERROR" | "ENGINE_OUTPUT_EMPTY" | "ENGINE_OUTPUT_INVALID" | "NOT_FOUND" | "VALIDATION_ERROR" | "CONFLICT" | "INTERNAL" | "DOWNLOAD_ENGINE_UNAVAILABLE";
         message: string;
         retryable: boolean;
     };
@@ -39,6 +39,10 @@ export declare const appErrors: {
     expired: (message?: string) => AppError;
     platformVerification: (message?: string) => AppError;
     youtubeExtractorError: (message?: string) => AppError;
+    youtubeMetadataAccessFailed: (message?: string) => AppError;
+    youtubeFormatAccessFailed: (message?: string) => AppError;
+    youtubeStreamAccessFailed: (message?: string) => AppError;
+    youtubeAuthRequired: (message?: string) => AppError;
     networkError: (message?: string) => AppError;
     engineError: (message?: string) => AppError;
     engineOutputEmpty: (message?: string) => AppError;

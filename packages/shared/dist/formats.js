@@ -131,11 +131,15 @@ export function dedupeFormats(formats) {
         const raw = videoByHeight.get(h);
         const normHeight = normalizeHeight(raw.height) ?? h;
         const fps = raw.fps ? Math.round(raw.fps) : 30;
+        const container = (raw.container || raw.extension || 'mp4').toLowerCase();
+        const mimeType = raw.mimeType || (container === 'webm' ? 'video/webm' : container === 'mkv' ? 'video/x-matroska' : 'video/mp4');
+        const containerLabel = container.toUpperCase();
         return {
             ...raw,
-            container: 'mp4',
-            label: `${normHeight}p MP4 · ${fps} fps · Best quality`,
-            mimeType: 'video/mp4',
+            container,
+            extension: raw.extension ?? container,
+            label: raw.label && raw.label.includes(containerLabel) ? raw.label : `${normHeight}p ${containerLabel} · ${fps} fps`,
+            mimeType,
             playable: raw.playable ?? (raw.kind === 'video+audio' || raw.kind === 'video'),
         };
     });
@@ -163,50 +167,98 @@ export function genericQualityLadder(maxHeight = MAX_QUALITY_HEIGHT) {
     return ladder;
 }
 /**
- * Evaluates whether a media format is directly playable in standard browser HTML5 video/audio elements.
- * Checks container, codecs, and video+audio presence.
+ * Evaluates whether a format candidate is directly playable in HTML5 video/audio elements
+ * based on REAL format metadata (codecs, container, audio/video channels, manifest protocol).
  */
-export function isDirectPlayCompatible(format) {
-    if (format.directPlayCompatible !== undefined) {
-        return format.directPlayCompatible;
-    }
+export function evaluatePlaybackCandidate(format) {
+    const incompatibilityReasons = [];
     const container = (format.extension ?? format.container ?? '').toLowerCase();
-    if (container === 'm3u8' || container.includes('hls') || container.includes('dash')) {
-        return false;
+    const isAudioOnly = format.kind === 'audio';
+    const rawVcodec = isAudioOnly
+        ? ''
+        : (format.videoCodec ?? (format.kind !== 'audio' ? format.codec : '') ?? '').toLowerCase();
+    const rawAcodec = (format.audioCodec ?? (format.kind === 'audio' ? format.codec : '') ?? '').toLowerCase();
+    const knownAudioCodecs = ['opus', 'vorbis', 'mp4a', 'aac', 'flac', 'ac3', 'eac3', 'dts', 'mp3'];
+    const vcodec = knownAudioCodecs.some((c) => rawVcodec.includes(c)) ? '' : rawVcodec;
+    const acodec = rawAcodec;
+    const isManifest = container === 'm3u8' || container.includes('hls') || container.includes('dash') || (format.sourceSelector ?? '').includes('m3u8');
+    if (isManifest) {
+        incompatibilityReasons.push('REQUIRES_MANIFEST_PLAYER');
     }
-    const vcodec = (format.videoCodec ?? format.codec ?? '').toLowerCase();
-    const isNonBrowserCodec = vcodec.includes('bytevc1') ||
+    const isNonBrowserVideo = vcodec.includes('bytevc1') ||
         vcodec.includes('hevc') ||
         vcodec.includes('h265') ||
         vcodec.includes('265') ||
         vcodec.includes('av01') ||
-        vcodec.includes('av1');
-    if (isNonBrowserCodec) {
-        return false;
+        vcodec.includes('av1') ||
+        vcodec.includes('prores');
+    if (isNonBrowserVideo) {
+        incompatibilityReasons.push(`UNSUPPORTED_VIDEO_CODEC:${vcodec}`);
+    }
+    const isNonBrowserAudio = acodec.includes('flac') ||
+        acodec.includes('ac3') ||
+        acodec.includes('eac3') ||
+        acodec.includes('dts');
+    if (isNonBrowserAudio) {
+        incompatibilityReasons.push(`UNSUPPORTED_AUDIO_CODEC:${acodec}`);
     }
     const hasVideo = format.hasVideo ?? (format.kind === 'video+audio' || format.kind === 'video');
     const hasAudio = format.hasAudio ?? (format.kind === 'video+audio' || format.kind === 'audio');
-    if (format.kind === 'audio') {
-        return hasAudio;
+    if (format.kind !== 'audio' && (!hasVideo || !hasAudio)) {
+        if (!hasAudio)
+            incompatibilityReasons.push('MISSING_AUDIO_STREAM');
+        if (!hasVideo)
+            incompatibilityReasons.push('MISSING_VIDEO_STREAM');
     }
-    // For HTML5 video playback, primary candidate MUST have combined video + audio
-    return hasVideo && hasAudio;
+    const isProgressive = !isManifest && (format.protocol ? !format.protocol.includes('m3u8') && !format.protocol.includes('dash') : true);
+    const directPlayCompatible = format.directPlayCompatible ?? incompatibilityReasons.length === 0;
+    // Calculate compatibility score for selection priority:
+    let compatibilityScore = 0;
+    if (directPlayCompatible) {
+        compatibilityScore += 10000;
+        if (container === 'mp4')
+            compatibilityScore += 2000;
+        if (vcodec.includes('avc') || vcodec.includes('h264') || vcodec.includes('mp4v'))
+            compatibilityScore += 3000;
+        if (acodec.includes('aac') || acodec.includes('mp4a'))
+            compatibilityScore += 1000;
+        const height = format.height ?? 0;
+        compatibilityScore += Math.min(height, 1440);
+        compatibilityScore += Math.min((format.fps ?? 30), 60);
+    }
+    else {
+        compatibilityScore -= incompatibilityReasons.length * 1000;
+        if (!hasAudio)
+            compatibilityScore -= 5000;
+        if (isNonBrowserVideo)
+            compatibilityScore -= 4000;
+    }
+    return {
+        formatId: format.formatId,
+        container,
+        videoCodec: vcodec || undefined,
+        audioCodec: acodec || undefined,
+        hasVideo,
+        hasAudio,
+        protocol: format.protocol,
+        isProgressive,
+        directPlayCompatible,
+        compatibilityScore,
+        incompatibilityReasons,
+    };
+}
+/**
+ * Evaluates whether a media format is directly playable in standard browser HTML5 video/audio elements.
+ * Checks container, codecs, and video+audio presence.
+ */
+export function isDirectPlayCompatible(format) {
+    return evaluatePlaybackCandidate(format).directPlayCompatible;
 }
 export function separateFormats(formats) {
     const downloadFormats = [...formats];
-    const playbackCandidates = formats.filter((f) => isDirectPlayCompatible(f));
-    // Sort playback candidates: MP4 with H.264 + AAC first, then higher height, fps, bitrate
-    playbackCandidates.sort((a, b) => {
-        const hA = normalizeHeight(a.height) ?? a.height ?? 0;
-        const hB = normalizeHeight(b.height) ?? b.height ?? 0;
-        if (hB !== hA)
-            return hB - hA;
-        const fpsA = a.fps ?? 30;
-        const fpsB = b.fps ?? 30;
-        if (fpsB !== fpsA)
-            return fpsB - fpsA;
-        return (b.bitrateKbps ?? 0) - (a.bitrateKbps ?? 0);
-    });
+    const playbackCandidates = formats
+        .filter((f) => isDirectPlayCompatible(f))
+        .sort((a, b) => evaluatePlaybackCandidate(b).compatibilityScore - evaluatePlaybackCandidate(a).compatibilityScore);
     const recommendedPlaybackFormat = playbackCandidates[0];
     const playbackFallbackCandidates = playbackCandidates.slice(1);
     return {
@@ -225,9 +277,12 @@ export function findFormatById(formats, formatId) {
  */
 export function getDirectPlayFormats(formats) {
     const deduped = dedupeFormats(formats);
-    const eligible = deduped.filter((f) => isDirectPlayCompatible(f));
-    if (eligible.length > 0)
-        return eligible;
+    const eligibleDeduped = deduped.filter((f) => isDirectPlayCompatible(f));
+    if (eligibleDeduped.length > 0)
+        return eligibleDeduped;
+    const eligibleRaw = formats.filter((f) => isDirectPlayCompatible(f));
+    if (eligibleRaw.length > 0)
+        return eligibleRaw;
     // Fallback: any video format that is marked playable
     return deduped.filter((f) => f.kind !== 'audio' && f.playable !== false);
 }

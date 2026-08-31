@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { appErrors, assertPublicHttpUrl, hashWithPepper, newId, safeArtifactPath, signExpiringToken, toAppError, verifyExpiringToken, HTTP_STATUS_BY_CODE, jobIdParamSchema, createJobRequestSchema, resolveRequestSchema, } from '@3ap/shared';
-import { requireBinary, runYtDlp } from '@3ap/adapters';
+import { getValidCookiesPath, requireBinary, runYtDlp } from '@3ap/adapters';
 import { SlidingWindowRateLimiter } from './lib/rate-limit.js';
 import { ResolveService } from './services/resolve-service.js';
 import { JobService } from './services/job-service.js';
@@ -603,10 +603,123 @@ export async function buildApp(deps) {
             };
             const binary = await requireBinary(process.env.YT_DLP_PATH, log);
             const rawFormatId = (format.sourceSelector ?? format.formatId).replace(/^[vfa]:/, '');
-            // TIER 1 Check: Try single progressive stream if format is video+audio
-            if (format.kind === 'video+audio') {
+            const validCookiePath = getValidCookiesPath();
+            const commonYtArgs = [
+                '--js-runtimes', 'node',
+                ...(validCookiePath ? ['--cookies', validCookiePath] : []),
+            ];
+            const isAudioOnlyFormat = format.kind === 'audio';
+            const rawVcodec = isAudioOnlyFormat
+                ? ''
+                : (format.videoCodec ?? (format.kind !== 'audio' ? format.codec : '') ?? '').toLowerCase();
+            const rawAcodec = (format.audioCodec ?? (format.kind === 'audio' ? format.codec : '') ?? '').toLowerCase();
+            const knownAudioCodecs = ['opus', 'vorbis', 'mp4a', 'aac', 'flac', 'ac3', 'eac3', 'dts', 'mp3'];
+            const vcodec = knownAudioCodecs.some((c) => rawVcodec.includes(c)) ? '' : rawVcodec;
+            const acodec = rawAcodec;
+            if (isAudioOnlyFormat) {
+                broadcastLog('STREAM', 'UPSTREAM_REQUEST_STARTED', `Extracting audio stream (${rawFormatId}) via yt-dlp`, {
+                    resolveId,
+                    itemId,
+                    formatId,
+                    rawFormatId,
+                });
                 try {
-                    const { stdout } = await runYtDlp(binary, ['--get-url', '--format', `${rawFormatId}/b[vcodec!=none][acodec!=none]/18/22`, item.sourceUrl], { timeoutMs: 15_000 });
+                    const { stdout } = await runYtDlp(binary, ['--get-url', ...commonYtArgs, '-f', `${rawFormatId}/bestaudio/140/139/best`, item.sourceUrl], { timeoutMs: 15_000 });
+                    streamUrl = stdout.trim().split('\n')[0] ?? '';
+                }
+                catch (err) {
+                    log.warn('Audio stream URL extraction failed', { error: err });
+                }
+                if (streamUrl) {
+                    assertPublicHttpUrl(streamUrl);
+                    const isDirectPlayableAudio = acodec.includes('aac') || acodec.includes('mp4a') || acodec.includes('mp3') || format.container === 'mp3' || format.container === 'm4a';
+                    if (isDirectPlayableAudio) {
+                        // Native audio stream: served directly via proxy below
+                    }
+                    else {
+                        // Transcode non-browser audio (Opus / FLAC) to AAC fMP4 without video (-vn)
+                        const seekSeconds = parseFloat(query.ss ?? '0');
+                        const seekArgs = Number.isFinite(seekSeconds) && seekSeconds > 0 ? ['-ss', String(seekSeconds)] : [];
+                        const headerStr = `User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36\r\n${record.platform === 'youtube' ? 'Referer: https://www.youtube.com/\r\n' : ''}`;
+                        const ffmpegArgs = [
+                            '-headers', headerStr,
+                            ...seekArgs,
+                            '-i', streamUrl,
+                            '-vn',
+                            '-c:a', 'aac',
+                            '-b:a', '128k',
+                            '-f', 'mp4',
+                            '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+                            'pipe:1',
+                        ];
+                        const sanitizeUrl = (u) => {
+                            try {
+                                const parsed = new URL(u);
+                                parsed.search = '?...[token_hidden]';
+                                return parsed.toString();
+                            }
+                            catch {
+                                return u.length > 60 ? u.slice(0, 60) + '...' : u;
+                            }
+                        };
+                        log.info('[DirectPlay FFmpeg Diagnostics (Audio Only)]', {
+                            resolveId,
+                            itemId,
+                            ffmpegPath: 'ffmpeg',
+                            strategy: 'TRANSCODE_AUDIO_ONLY',
+                            inputAudioCodec: acodec || 'unknown',
+                            sanitizedAudioUrl: sanitizeUrl(streamUrl),
+                            sanitizedArgs: ffmpegArgs.map((a) => (a.startsWith('http') ? sanitizeUrl(a) : a)),
+                            outputContentType: 'audio/mp4',
+                        });
+                        const ffmpegProc = spawn('ffmpeg', ffmpegArgs);
+                        let bytesEmitted = 0;
+                        let firstByteTimeMs = null;
+                        let ffmpegStderr = '';
+                        let isClientDisconnected = false;
+                        const startTime = Date.now();
+                        ffmpegProc.stdout.on('data', (chunk) => {
+                            if (bytesEmitted === 0)
+                                firstByteTimeMs = Date.now() - startTime;
+                            bytesEmitted += chunk.length;
+                        });
+                        ffmpegProc.stderr.on('data', (data) => {
+                            const str = data.toString();
+                            if (ffmpegStderr.length < 4096)
+                                ffmpegStderr += str;
+                        });
+                        ffmpegProc.on('close', (code, signal) => {
+                            const elapsedMs = Date.now() - startTime;
+                            log.info('[DirectPlay FFmpeg Process Summary (Audio Only)]', {
+                                resolveId,
+                                itemId,
+                                exitCode: code,
+                                exitSignal: signal,
+                                elapsedMs,
+                                timeToFirstByteMs: firstByteTimeMs,
+                                totalBytesEmitted: bytesEmitted,
+                                clientDisconnected: isClientDisconnected,
+                            });
+                        });
+                        request.raw.on('close', () => {
+                            isClientDisconnected = true;
+                            if (!ffmpegProc.killed) {
+                                ffmpegProc.kill('SIGKILL');
+                            }
+                        });
+                        reply.header('content-type', 'audio/mp4');
+                        reply.header('accept-ranges', 'none');
+                        reply.header('content-disposition', 'inline');
+                        reply.header('cache-control', 'private, no-store');
+                        void reply.code(200);
+                        return ffmpegProc.stdout;
+                    }
+                }
+            }
+            // TIER 1 Check: Try single progressive stream if format is video+audio
+            if (!isAudioOnlyFormat && format.kind === 'video+audio') {
+                try {
+                    const { stdout } = await runYtDlp(binary, ['--get-url', ...commonYtArgs, '--format', `${rawFormatId}/b[vcodec!=none][acodec!=none]/18/22/best`, item.sourceUrl], { timeoutMs: 15_000 });
                     const lines = stdout.trim().split('\n').map((l) => l.trim()).filter(Boolean);
                     if (lines.length === 1 && lines[0]) {
                         streamUrl = lines[0];
@@ -616,8 +729,8 @@ export async function buildApp(deps) {
                     // Fall back to Tier 2 transmuxing
                 }
             }
-            // TIER 2 Transmuxing: Separate video & audio streams via FFmpeg
-            if (!streamUrl) {
+            // TIER 2 Transmuxing / Transcoding: Separate video & audio streams via FFmpeg
+            if (!streamUrl && !isAudioOnlyFormat) {
                 broadcastLog('STREAM', 'UPSTREAM_REQUEST_STARTED', `Extracting separate video (${rawFormatId}) and audio streams via yt-dlp`, {
                     resolveId,
                     itemId,
@@ -627,7 +740,8 @@ export async function buildApp(deps) {
                 let videoUrl = '';
                 let audioUrl = '';
                 try {
-                    const { stdout } = await runYtDlp(binary, ['--get-url', '-f', `${rawFormatId}+bestaudio[ext=m4a]/bestaudio/140/139`, item.sourceUrl], { timeoutMs: 15_000 });
+                    const selector = `${rawFormatId}+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio/best`;
+                    const { stdout } = await runYtDlp(binary, ['--get-url', ...commonYtArgs, '-f', selector, item.sourceUrl], { timeoutMs: 15_000 });
                     const lines = stdout.trim().split('\n').map((l) => l.trim()).filter(Boolean);
                     if (lines.length >= 2) {
                         videoUrl = lines[0];
@@ -643,7 +757,7 @@ export async function buildApp(deps) {
                 // If audio URL wasn't retrieved in combined call, retrieve it separately
                 if (videoUrl && !audioUrl) {
                     try {
-                        const { stdout } = await runYtDlp(binary, ['--get-url', '-f', 'bestaudio[ext=m4a]/bestaudio/140/139', item.sourceUrl], { timeoutMs: 10_000 });
+                        const { stdout } = await runYtDlp(binary, ['--get-url', ...commonYtArgs, '-f', 'bestaudio[ext=m4a]/bestaudio/140/139', item.sourceUrl], { timeoutMs: 10_000 });
                         audioUrl = stdout.trim().split('\n')[0] ?? '';
                     }
                     catch (audioErr) {
@@ -653,12 +767,23 @@ export async function buildApp(deps) {
                 if (videoUrl && audioUrl) {
                     assertPublicHttpUrl(videoUrl);
                     assertPublicHttpUrl(audioUrl);
-                    broadcastLog('STREAM', 'FFMPEG_STARTED', `Spawning FFmpeg transmuxer for ${format.height ?? 480}p MP4 playback`, {
-                        resolveId,
-                        itemId,
-                        formatId,
-                        videoCodec: format.codec ?? 'h264',
-                    });
+                    // Codec compatibility analysis: STRATEGY 3 (Remux Copy) vs STRATEGY 4 (Transcode Fallback)
+                    const isH264 = !vcodec || vcodec.includes('avc') || vcodec.includes('h264') || vcodec.includes('mp4v');
+                    const isAacOrMp3 = !acodec || acodec.includes('aac') || acodec.includes('mp4a') || acodec.includes('mp3');
+                    const needsTranscode = !isH264 || !isAacOrMp3;
+                    const codecArgs = needsTranscode
+                        ? [
+                            '-c:v', 'libx264',
+                            '-preset', 'ultrafast',
+                            '-tune', 'zerolatency',
+                            '-pix_fmt', 'yuv420p',
+                            '-c:a', 'aac',
+                            '-b:a', '128k',
+                        ]
+                        : [
+                            '-c:v', 'copy',
+                            '-c:a', 'copy',
+                        ];
                     const headerStr = `User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36\r\n${record.platform === 'youtube' ? 'Referer: https://www.youtube.com/\r\n' : ''}`;
                     const seekSeconds = parseFloat(query.ss ?? '0');
                     const seekArgs = Number.isFinite(seekSeconds) && seekSeconds > 0 ? ['-ss', String(seekSeconds)] : [];
@@ -669,24 +794,89 @@ export async function buildApp(deps) {
                         '-headers', headerStr,
                         ...seekArgs,
                         '-i', audioUrl,
-                        '-c:v', 'copy',
-                        '-c:a', 'copy',
+                        ...codecArgs,
                         '-f', 'mp4',
                         '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
                         'pipe:1',
                     ];
-                    const ffmpegProc = spawn('ffmpeg', ffmpegArgs);
-                    ffmpegProc.stderr.on('data', (data) => {
-                        const errChunk = data.toString();
-                        if (errChunk.includes('Error') || errChunk.includes('error')) {
-                            broadcastLog('WARN', 'FFMPEG_STDERR', errChunk.slice(0, 200), { resolveId });
+                    const sanitizeUrl = (u) => {
+                        try {
+                            const parsed = new URL(u);
+                            parsed.search = '?...[token_hidden]';
+                            return parsed.toString();
                         }
+                        catch {
+                            return u.length > 60 ? u.slice(0, 60) + '...' : u;
+                        }
+                    };
+                    log.info('[DirectPlay FFmpeg Diagnostics]', {
+                        resolveId,
+                        itemId,
+                        ffmpegPath: 'ffmpeg',
+                        strategy: needsTranscode ? 'TRANSCODE' : 'REMUX',
+                        inputVideoCodec: vcodec || 'unknown/h264',
+                        inputAudioCodec: acodec || 'unknown/aac',
+                        sanitizedVideoUrl: sanitizeUrl(videoUrl),
+                        sanitizedAudioUrl: sanitizeUrl(audioUrl),
+                        sanitizedArgs: ffmpegArgs.map((a) => (a.startsWith('http') ? sanitizeUrl(a) : a)),
+                        outputContentType: 'video/mp4',
+                    });
+                    broadcastLog('STREAM', 'FFMPEG_STARTED', `Spawning FFmpeg ${needsTranscode ? 'transcoder' : 'remuxer'} for ${format.height ?? 480}p MP4 playback`, {
+                        resolveId,
+                        itemId,
+                        formatId,
+                        strategy: needsTranscode ? 'TRANSCODE' : 'REMUX',
+                        videoCodec: vcodec || 'h264',
+                    });
+                    const ffmpegProc = spawn('ffmpeg', ffmpegArgs);
+                    let bytesEmitted = 0;
+                    let firstByteTimeMs = null;
+                    let isValidFtypHeader = false;
+                    let ffmpegStderr = '';
+                    let isClientDisconnected = false;
+                    const startTime = Date.now();
+                    ffmpegProc.stdout.on('data', (chunk) => {
+                        if (bytesEmitted === 0) {
+                            firstByteTimeMs = Date.now() - startTime;
+                            if (chunk.length >= 8 && chunk.toString('ascii', 4, 8) === 'ftyp') {
+                                isValidFtypHeader = true;
+                            }
+                        }
+                        bytesEmitted += chunk.length;
+                    });
+                    ffmpegProc.stderr.on('data', (data) => {
+                        const str = data.toString();
+                        if (ffmpegStderr.length < 4096)
+                            ffmpegStderr += str;
+                        if (str.toLowerCase().includes('error')) {
+                            broadcastLog('WARN', 'FFMPEG_STDERR', str.slice(0, 200), { resolveId });
+                        }
+                    });
+                    ffmpegProc.on('close', (code, signal) => {
+                        const elapsedMs = Date.now() - startTime;
+                        log.info('[DirectPlay FFmpeg Process Summary]', {
+                            resolveId,
+                            itemId,
+                            exitCode: code,
+                            exitSignal: signal,
+                            elapsedMs,
+                            timeToFirstByteMs: firstByteTimeMs,
+                            totalBytesEmitted: bytesEmitted,
+                            isValidFtypHeader,
+                            clientDisconnected: isClientDisconnected,
+                            ...(code !== 0 && !isClientDisconnected ? { ffmpegStderrTail: ffmpegStderr.slice(-1000) } : {}),
+                        });
                     });
                     // Cancellation safety: kill FFmpeg process immediately if client disconnects
                     request.raw.on('close', () => {
+                        isClientDisconnected = true;
                         if (!ffmpegProc.killed) {
-                            log.info('[DirectPlay FFmpeg] Client disconnected, terminating FFmpeg transmuxer', { resolveId, itemId });
-                            broadcastLog('STREAM', 'PLAYBACK_ABORTED', 'Client disconnected during FFmpeg transmuxing', { resolveId });
+                            log.info('[DirectPlay FFmpeg] Client disconnected, terminating FFmpeg process', {
+                                resolveId,
+                                itemId,
+                                bytesEmittedBeforeDisconnect: bytesEmitted,
+                            });
+                            broadcastLog('STREAM', 'PLAYBACK_ABORTED', 'Client disconnected during FFmpeg streaming', { resolveId });
                             ffmpegProc.kill('SIGKILL');
                         }
                     });
@@ -695,7 +885,7 @@ export async function buildApp(deps) {
                     reply.header('content-disposition', 'inline');
                     reply.header('cache-control', 'private, no-store');
                     void reply.code(200);
-                    broadcastLog('STREAM', 'MEDIA_LOADSTART', `Transmuxing stream started for ${format.height ?? 480}p`, {
+                    broadcastLog('STREAM', 'MEDIA_LOADSTART', `FFmpeg ${needsTranscode ? 'transcoding' : 'remuxing'} stream started for ${format.height ?? 480}p`, {
                         resolveId,
                         itemId,
                         formatId,

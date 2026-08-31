@@ -29,6 +29,24 @@ export declare function dedupeFormats(formats: MediaFormat[]): MediaFormat[];
  * formats are not known up front. Labels describe a ceiling, never a promise.
  */
 export declare function genericQualityLadder(maxHeight?: number): MediaFormat[];
+export interface PlaybackCandidateScore {
+    formatId: string;
+    container: string;
+    videoCodec?: string;
+    audioCodec?: string;
+    hasVideo: boolean;
+    hasAudio: boolean;
+    protocol?: string;
+    isProgressive: boolean;
+    directPlayCompatible: boolean;
+    compatibilityScore: number;
+    incompatibilityReasons: string[];
+}
+/**
+ * Evaluates whether a format candidate is directly playable in HTML5 video/audio elements
+ * based on REAL format metadata (codecs, container, audio/video channels, manifest protocol).
+ */
+export declare function evaluatePlaybackCandidate(format: MediaFormat): PlaybackCandidateScore;
 /**
  * Evaluates whether a media format is directly playable in standard browser HTML5 video/audio elements.
  * Checks container, codecs, and video+audio presence.

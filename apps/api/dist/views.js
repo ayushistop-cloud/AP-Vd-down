@@ -1,3 +1,4 @@
+import { evaluatePlaybackCandidate, } from '@3ap/shared';
 /** Strip adapter-internal fields before exposing formats to clients. */
 export function publicFormats(formats) {
     return formats.map(({ sourceSelector: _ignored, ...rest }) => rest);
@@ -34,8 +35,12 @@ export function resolveRecordToView(record, resolveCtx) {
                 return view;
             });
             const downloadFormats = [...publicFormatsList];
-            const directCandidates = publicFormatsList.filter((f) => f.directPlayCompatible === true);
-            const fallbackCandidates = publicFormatsList.filter((f) => f.playable && f.kind === 'video+audio');
+            const directCandidates = publicFormatsList
+                .filter((f) => f.directPlayCompatible === true)
+                .sort((a, b) => evaluatePlaybackCandidate(b).compatibilityScore - evaluatePlaybackCandidate(a).compatibilityScore);
+            const fallbackCandidates = publicFormatsList
+                .filter((f) => f.playable && f.kind === 'video+audio')
+                .sort((a, b) => evaluatePlaybackCandidate(b).compatibilityScore - evaluatePlaybackCandidate(a).compatibilityScore);
             const playbackCandidates = directCandidates.length > 0 ? directCandidates : fallbackCandidates;
             const recommendedPlaybackFormat = playbackCandidates[0] ??
                 publicFormatsList.find((f) => f.playable && f.kind !== 'audio' && f.container?.toLowerCase() === 'mp4') ??

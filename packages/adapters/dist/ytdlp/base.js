@@ -600,47 +600,59 @@ export function classifyYtDlpStderr(stderrTail, timedOut) {
     if (/does not look like a netscape format cookies file|invalid cookies? file|error loading cookies/i.test(text)) {
         return appErrors.temporaryProviderError('Media service encountered an invalid server cookies configuration. Please retry.');
     }
-    // 1. Genuine private / login-gated content
+    // 1. Genuine private / login-gated content / auth required
     if (/\bprivate video\b|\bmembers-only\b|\bjoin this channel to get access\b|\bthis video is private\b|\baccount is private\b|\bthis content is private\b/i.test(text)) {
         return appErrors.notPublic();
     }
+    if (/\bsign in to confirm your identity\b|\blogin required\b|\bauthentication required\b/i.test(text)) {
+        return appErrors.youtubeAuthRequired();
+    }
     // 2. Explicit YouTube Bot / Verification / Challenge / Age check / PO Token
-    if (/sign in to confirm you['’]?re not a bot|confirm you['’]?re not a bot|sign in to confirm|confirm your age|\bpo_token\b|\bpo token\b|n-sig extraction failed|nsig extraction failed|signature extraction failed|bot detection|bot verification|captcha/i.test(text)) {
+    // Note: n-sig decipher failures are NOT bot verification! They are format extraction decipher errors.
+    if (/sign in to confirm you['’]?re not a bot|confirm you['’]?re not a bot|confirm your age|\bpo_token\b|\bpo token\b|bot detection|bot verification|captcha/i.test(text)) {
         return appErrors.platformVerification('YouTube currently requires provider verification. Please try again later or supply valid cookies.');
     }
-    // 3. HTTP 403 Forbidden
+    // 3. YouTube Format Access / Decipher / nsig failure
+    if (/n-sig extraction failed|nsig extraction failed|signature extraction failed|unable to extract player|player_url|could not extract js/i.test(text)) {
+        return appErrors.youtubeFormatAccessFailed('YouTube format deciphering failed. Please try again shortly or with another video.');
+    }
+    // 4. YouTube Metadata Access failure
+    if (/unable to extract video data|unable to download video info|unable to extract title/i.test(text)) {
+        return appErrors.youtubeMetadataAccessFailed();
+    }
+    // 5. HTTP 403 Forbidden
     if (/http error 403|403 forbidden/i.test(text)) {
         return appErrors.temporaryProviderError('The platform temporarily restricted access (HTTP 403). Please try again shortly.');
     }
-    // 4. Rate limiting (HTTP 429)
+    // 6. Rate limiting (HTTP 429)
     if (/http error 429|too many requests|rate.?limit/i.test(text)) {
         return appErrors.rateLimited('Too many requests. Please wait a moment and try again.');
     }
-    // 5. Video unavailable / removed
+    // 7. Video unavailable / removed
     if (/video unavailable|removed by the uploader|has been terminated|does not exist|this video has been removed/i.test(text)) {
         return appErrors.unsupported('This content is no longer available at the platform.');
     }
-    // 6. Region / Geo Restricted
+    // 8. Region / Geo Restricted
     if (/geo-?restrict|not available in your country/i.test(text)) {
         return appErrors.notPublic('This content is region-restricted and not available from this service.');
     }
-    // 7. Invalid URL or format missing
+    // 9. Invalid URL or format missing
     if (/unsupported url|not a valid url|no video formats|no media formats/i.test(text)) {
         return appErrors.unsupported();
     }
-    // 8. Size limit exceeded
+    // 10. Size limit exceeded
     if (/file is larger than|max-filesize/i.test(text)) {
         return appErrors.tooLarge();
     }
-    // 9. Upstream server / network / DNS / TLS error
+    // 11. Upstream server / network / DNS / TLS error
     if (/temporary failure|http error 5\d\d|unable to download webpage|connection reset|timed out|could not resolve host|getaddrinfo|tls handshake|socket error/i.test(text)) {
         return appErrors.networkError('The media provider could not be reached. Please try again.');
     }
-    // 10. YouTube Extractor specific errors
+    // 12. YouTube Extractor specific errors
     if (/\[youtube\]/i.test(text) || /youtube/i.test(text)) {
         return appErrors.youtubeExtractorError('YouTube media could not be resolved right now. Please try another public video.');
     }
-    // 11. Generic Engine Error fallback (503 retryable, NOT 500)
+    // 13. Generic Engine Error fallback (503 retryable, NOT 500)
     return appErrors.engineError('The media service is temporarily unavailable.');
 }
 //# sourceMappingURL=base.js.map
