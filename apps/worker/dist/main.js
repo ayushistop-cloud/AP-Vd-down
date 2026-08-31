@@ -1,3 +1,4 @@
+import http from 'node:http';
 import { createLogger, loadConfig, MetricsRegistry } from '@3ap/shared';
 import { checkEngineAtBoot, createDefaultAdapters } from '@3ap/adapters';
 import { createQueue } from '@3ap/queue';
@@ -5,8 +6,17 @@ import { MemoryStore, PostgresStore } from '@3ap/store';
 import { startEmbeddedWorker } from './index.js';
 export * from './index.js';
 const isMain = process.argv[1]?.replace(/\\/g, '/').endsWith('/apps/worker/dist/main.js') ||
-    process.argv[1]?.replace(/\\/g, '/').endsWith('/apps/worker/src/main.ts');
+    process.argv[1]?.replace(/\\/g, '/').endsWith('/apps/worker/src/main.ts') ||
+    process.argv[1]?.replace(/\\/g, '/').endsWith('/dist/main.js') ||
+    process.argv[1]?.replace(/\\/g, '/').endsWith('/src/main.ts');
 if (isMain) {
+    const port = process.env.PORT || 10000;
+    const dummyServer = http.createServer((_req, res) => {
+        res.writeHead(200);
+        res.end('Worker is alive (Antigravity active)\n');
+    }).listen(port, () => {
+        console.log(`Dummy server listening on port ${port} to satisfy Render Web Service requirements.`);
+    });
     const config = loadConfig();
     const log = createLogger({ service: 'worker', level: config.LOG_LEVEL });
     const metrics = new MetricsRegistry();
@@ -31,6 +41,7 @@ if (isMain) {
         log.info('worker started', { artifactRoot: config.ARTIFACT_ROOT, env: config.NODE_ENV });
         const shutdown = () => {
             log.info('shutting down worker gracefully');
+            dummyServer.close();
             void worker.stop().then(() => queue.close()).then(() => store.close()).finally(() => {
                 log.info('worker shutdown complete');
                 process.exit(0);
