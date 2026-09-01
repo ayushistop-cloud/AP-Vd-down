@@ -97,6 +97,12 @@ export function getValidCookiesPath() {
     }
     return undefined;
 }
+export const DISABLED_COOKIE_PREP = {
+    enabled: false,
+    configuredPath: undefined,
+    sourceReadable: false,
+    runtimeWritable: false,
+};
 /**
  * Central utility for preparing yt-dlp cookie files.
  *

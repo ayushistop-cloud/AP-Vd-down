@@ -1,7 +1,7 @@
 import { type AdapterCapabilities, type AppError } from '@3ap/shared';
 import type { DownloadRequest, DownloadTaskContext, DownloadTaskResult, MediaAdapter, ResolveOutput } from '../contract.js';
-import { getValidCookiesPath, isValidNetscapeCookieFile, prepareYtDlpCookies } from './cookies.js';
-export { getValidCookiesPath, isValidNetscapeCookieFile, prepareYtDlpCookies };
+import { DISABLED_COOKIE_PREP, getValidCookiesPath, isValidNetscapeCookieFile, prepareYtDlpCookies } from './cookies.js';
+export { DISABLED_COOKIE_PREP, getValidCookiesPath, isValidNetscapeCookieFile, prepareYtDlpCookies };
 /**
  * Sanitizes stderr text to ensure tokens, signatures, and cookies are never logged.
  */
@@ -27,6 +27,12 @@ export declare abstract class YtDlpBaseAdapter implements MediaAdapter {
     canHandle(url: string): boolean;
     normalizeError(error: unknown): AppError;
     protected getExtractionStrategies(): YtDlpExtractionStrategy[];
+    /**
+     * Per-platform cookie policy (docs/22-SECURITY.md).
+     * By default, yt-dlp adapters do NOT receive global cookies. Subclasses
+     * (e.g. YouTubeAdapter) override this to return true when configured.
+     */
+    protected shouldUseCookies(): boolean;
     resolve(rawUrl: string): Promise<ResolveOutput>;
     private resolvePlaylist;
     private resolveSingleOrCollection;

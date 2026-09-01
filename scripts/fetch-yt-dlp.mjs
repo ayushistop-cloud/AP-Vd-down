@@ -94,9 +94,9 @@ async function downloadAsset(assetName, releaseInfo) {
     throw new Error(`unknown asset checksum for ${assetName}`);
   }
 
-  // Skip when the exact version is already installed and intact.
+  // Skip when the exact version is already installed and intact (unless FORCE_ENGINE_UPDATE is set).
   try {
-    if (statSync(destPath).size > 0) {
+    if (!process.env.FORCE_ENGINE_UPDATE && statSync(destPath).size > 0) {
       const existing = createHash('sha256').update(readFileSync(destPath)).digest('hex');
       if (existing === expectedSha256) {
         console.log(JSON.stringify({ event: 'setup_engine_skipped', reason: `${version} ${assetName} already installed`, path: destPath }));

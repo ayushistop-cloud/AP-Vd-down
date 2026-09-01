@@ -28,5 +28,8 @@ export class YouTubeAdapter extends YtDlpBaseAdapter {
             { name: 'youtube_mweb', args: ['--extractor-args', 'youtube:player_client=mweb,web'] },
         ];
     }
+    shouldUseCookies() {
+        return true;
+    }
 }
 //# sourceMappingURL=youtube.js.map

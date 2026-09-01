@@ -11,5 +11,6 @@ export declare class YouTubeAdapter extends YtDlpBaseAdapter {
     readonly platform: "youtube";
     constructor();
     protected getExtractionStrategies(): YtDlpExtractionStrategy[];
+    protected shouldUseCookies(): boolean;
 }
 //# sourceMappingURL=youtube.d.ts.map

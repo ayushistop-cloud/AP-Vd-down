@@ -2,9 +2,9 @@ import { readdir, rm, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { appErrors, assertPublicHttpUrl, buildFileName, canonicalizeUrl, createLogger, detectPlatform, genericQualityLadder, heightToLabel, MAX_QUALITY_HEIGHT, toAppError, } from '@3ap/shared';
 import { detectJsRuntime, findFfmpegBinary, requireBinary, resolveYtDlpEngine, runYtDlp, YtDlpError } from './binary.js';
-import { getValidCookiesPath, isValidNetscapeCookieFile, prepareYtDlpCookies } from './cookies.js';
+import { DISABLED_COOKIE_PREP, getValidCookiesPath, isValidNetscapeCookieFile, prepareYtDlpCookies } from './cookies.js';
 import { buildDisplayFormats, normalizeYtDlpFormats } from './formats.js';
-export { getValidCookiesPath, isValidNetscapeCookieFile, prepareYtDlpCookies };
+export { DISABLED_COOKIE_PREP, getValidCookiesPath, isValidNetscapeCookieFile, prepareYtDlpCookies };
 /**
  * Sanitizes stderr text to ensure tokens, signatures, and cookies are never logged.
  */
@@ -37,6 +37,14 @@ export class YtDlpBaseAdapter {
     }
     getExtractionStrategies() {
         return [{ name: 'default', args: [] }];
+    }
+    /**
+     * Per-platform cookie policy (docs/22-SECURITY.md).
+     * By default, yt-dlp adapters do NOT receive global cookies. Subclasses
+     * (e.g. YouTubeAdapter) override this to return true when configured.
+     */
+    shouldUseCookies() {
+        return false;
     }
     async resolve(rawUrl) {
         const canonicalUrl = canonicalizeUrl(assertPublicHttpUrl(rawUrl).toString());
@@ -149,7 +157,9 @@ export class YtDlpBaseAdapter {
         const hostname = new URL(url).hostname;
         const platformArgs = this.getPlatformExtraArgs();
         const strategies = this.getExtractionStrategies();
-        const cookiePrep = await prepareYtDlpCookies();
+        const cookiePrep = this.shouldUseCookies()
+            ? await prepareYtDlpCookies()
+            : DISABLED_COOKIE_PREP;
         try {
             const cookieArgs = cookiePrep.enabled && cookiePrep.runtimeCookiePath ? ['--cookies', cookiePrep.runtimeCookiePath] : [];
             let stdout = '';
@@ -353,7 +363,9 @@ export class YtDlpBaseAdapter {
         const platformArgs = this.getPlatformExtraArgs();
         const strategies = this.getExtractionStrategies();
         const absWorkDir = resolve(ctx.workDir);
-        const cookiePrep = await prepareYtDlpCookies();
+        const cookiePrep = this.shouldUseCookies()
+            ? await prepareYtDlpCookies()
+            : DISABLED_COOKIE_PREP;
         try {
             const cookieArgs = cookiePrep.enabled && cookiePrep.runtimeCookiePath ? ['--cookies', cookiePrep.runtimeCookiePath] : [];
             let downloaded = false;

@@ -80,6 +80,7 @@ export async function startApi() {
             'GET  /',
             'GET  /health',
             'GET  /healthz',
+            'GET  /health/diagnostics',
             'GET  /api/v1/meta/platforms',
             'POST /api/v1/resolve',
             'GET  /api/v1/resolve/:resolveId/items/:itemId/stream',

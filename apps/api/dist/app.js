@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { appErrors, assertPublicHttpUrl, hashWithPepper, newId, safeArtifactPath, signExpiringToken, toAppError, verifyExpiringToken, HTTP_STATUS_BY_CODE, jobIdParamSchema, createJobRequestSchema, resolveRequestSchema, } from '@3ap/shared';
-import { prepareYtDlpCookies, performCookieStartupCheck, requireBinary, runYtDlp, runSelfDiagnostics } from '@3ap/adapters';
+import { prepareYtDlpCookies, performCookieStartupCheck, requireBinary, runYtDlp, runSelfDiagnostics, resolveYtDlpEngine, findFfmpegBinary, detectJsRuntime } from '@3ap/adapters';
 import { SlidingWindowRateLimiter } from './lib/rate-limit.js';
 import { ResolveService } from './services/resolve-service.js';
 import { JobService } from './services/job-service.js';
@@ -118,6 +118,30 @@ export async function buildApp(deps) {
             status: storeOk ? 'ok' : 'degraded',
             uptimeSeconds: Math.round(process.uptime()),
             queue: depths ? { queued: depths.queued, processing: depths.processing } : null,
+        };
+    });
+    app.get('/health/diagnostics', async () => {
+        let dbConnected = false;
+        try {
+            dbConnected = await store.healthCheck();
+        }
+        catch { }
+        const engine = await resolveYtDlpEngine().catch(() => null);
+        const ffmpeg = await findFfmpegBinary().catch(() => null);
+        const jsRuntime = detectJsRuntime();
+        const cookieDiag = performCookieStartupCheck();
+        return {
+            apiVersion: 'v1',
+            nodeVersion: process.version,
+            ytDlpPath: engine?.path ?? null,
+            ytDlpVersion: engine?.version ?? null,
+            ffmpegAvailable: !!ffmpeg,
+            ffmpegVersion: ffmpeg ? 'ffmpeg-available' : null,
+            jsRuntimeAvailable: jsRuntime.available,
+            cookiesConfigured: cookieDiag.cookiesConfigured,
+            cookiesReadable: cookieDiag.cookiesReadable,
+            executionMode: config.DOWNLOAD_EXECUTION_MODE,
+            databaseConnected: dbConnected,
         };
     });
     app.get('/metrics', async () => ({ ...metrics.snapshot() }));

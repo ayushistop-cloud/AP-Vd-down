@@ -18,5 +18,19 @@ export class TikTokAdapter extends YtDlpBaseAdapter {
             },
         });
     }
+    getExtractionStrategies() {
+        return [
+            { name: 'tiktok_default', args: [] },
+            {
+                name: 'tiktok_web_useragent',
+                args: [
+                    '--user-agent',
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                    '--referer',
+                    'https://www.tiktok.com/',
+                ],
+            },
+        ];
+    }
 }
 //# sourceMappingURL=tiktok.js.map

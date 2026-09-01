@@ -20,6 +20,7 @@ export interface YtDlpCookiePreparation {
     runtimeWritable?: boolean;
     cleanup?: () => Promise<void>;
 }
+export declare const DISABLED_COOKIE_PREP: YtDlpCookiePreparation;
 /**
  * Central utility for preparing yt-dlp cookie files.
  *
