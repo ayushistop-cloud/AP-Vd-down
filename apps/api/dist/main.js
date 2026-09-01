@@ -82,10 +82,14 @@ export async function startApi() {
             'GET  /healthz',
             'GET  /api/v1/meta/platforms',
             'POST /api/v1/resolve',
+            'GET  /api/v1/resolve/:resolveId/items/:itemId/stream',
+            'GET  /api/v1/resolve/:resolveId/items/:itemId/thumbnail',
             'POST /api/v1/jobs',
             'GET  /api/v1/jobs/:id',
             'POST /api/v1/jobs/:id/cancel',
             'GET  /api/v1/jobs/:id/download',
+            'GET  /api/v1/jobs/:id/items/:itemId/stream',
+            'GET  /api/v1/jobs/:id/stream',
         ],
     });
     let shuttingDown = false;
