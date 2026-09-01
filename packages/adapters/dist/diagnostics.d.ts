@@ -18,6 +18,8 @@ export interface SelfDiagnosticsResult {
     };
     cookies: {
         configuredPath: string | null;
+        cookiesConfigured: boolean;
+        cookiesReadable: boolean;
     };
     testUrlResult?: {
         url: string;

@@ -8,7 +8,8 @@ export * from './facebook.js';
 export * from './terabox.js';
 export * from './http-download.js';
 export { checkEngineAtBoot, resolveYtDlpEngine, resetBinaryCache, EngineUnavailableError, type EngineResolution, requireBinary, runYtDlp, detectJsRuntime, } from './ytdlp/binary.js';
-export { isValidNetscapeCookieFile, getValidCookiesPath, classifyYtDlpStderr } from './ytdlp/base.js';
+export { isValidNetscapeCookieFile, getValidCookiesPath, prepareYtDlpCookies, performCookieStartupCheck, } from './ytdlp/cookies.js';
+export { classifyYtDlpStderr, classifyYtDlpError } from './ytdlp/base.js';
 import type { ResolveOutput } from './contract.js';
 import { type AdapterRegistry } from './registry.js';
 /** Default production registry covering all MVP platforms. */

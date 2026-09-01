@@ -1,19 +1,11 @@
 import { type AdapterCapabilities, type AppError } from '@3ap/shared';
 import type { DownloadRequest, DownloadTaskContext, DownloadTaskResult, MediaAdapter, ResolveOutput } from '../contract.js';
+import { getValidCookiesPath, isValidNetscapeCookieFile, prepareYtDlpCookies } from './cookies.js';
+export { getValidCookiesPath, isValidNetscapeCookieFile, prepareYtDlpCookies };
 /**
  * Sanitizes stderr text to ensure tokens, signatures, and cookies are never logged.
  */
 export declare function sanitizeStderr(stderr: string): string;
-/**
- * Validates whether a file path exists, is a readable file, non-empty, and has a valid Netscape HTTP Cookie format structure.
- * Never logs cookie contents or sensitive secrets.
- */
-export declare function isValidNetscapeCookieFile(filePath: string): boolean;
-/**
- * Resolves a valid Netscape cookie file path from env vars or standard Render secret location.
- * Returns undefined if missing, empty, malformed, or unreadable.
- */
-export declare function getValidCookiesPath(): string | undefined;
 export interface YtDlpPlatformOptions {
     platform: MediaAdapter['platform'];
     capabilities: AdapterCapabilities;
@@ -49,5 +41,12 @@ export interface Selection {
 }
 /** Map the requested formatId onto a concrete yt-dlp format selector. */
 export declare function selectSelector(request: DownloadRequest): Selection;
-export declare function classifyYtDlpStderr(stderrTail: string, timedOut: boolean): AppError;
+export interface ClassifyYtDlpErrorOptions {
+    platform?: MediaAdapter['platform'];
+    stderr: string;
+    exitCode?: number | null;
+    timedOut?: boolean;
+}
+export declare function classifyYtDlpError(options: ClassifyYtDlpErrorOptions): AppError;
+export declare function classifyYtDlpStderr(stderrTail: string, timedOut: boolean, platform?: MediaAdapter['platform']): AppError;
 //# sourceMappingURL=base.d.ts.map

@@ -1,9 +1,11 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { resolveYtDlpEngine } from './ytdlp/binary.js';
-import { getValidCookiesPath, sanitizeStderr } from './ytdlp/base.js';
+import { sanitizeStderr } from './ytdlp/base.js';
+import { performCookieStartupCheck, prepareYtDlpCookies } from './ytdlp/cookies.js';
 const execFileAsync = promisify(execFile);
 export async function runSelfDiagnostics(testUrl) {
+    const startupCookieCheck = performCookieStartupCheck();
     const result = {
         timestamp: new Date().toISOString(),
         platform: process.platform,
@@ -22,7 +24,9 @@ export async function runSelfDiagnostics(testUrl) {
             jsRuntimeTestError: null,
         },
         cookies: {
-            configuredPath: getValidCookiesPath() || null,
+            configuredPath: startupCookieCheck.configuredPath,
+            cookiesConfigured: startupCookieCheck.cookiesConfigured,
+            cookiesReadable: startupCookieCheck.cookiesReadable,
         },
         testUrlResult: null,
     };
@@ -54,9 +58,9 @@ export async function runSelfDiagnostics(testUrl) {
                 formatsCount: 0,
             };
             const startTime = Date.now();
-            const cookiesPath = getValidCookiesPath();
-            const cookieArgs = cookiesPath ? ['--cookies', cookiesPath] : [];
+            const cookiePrep = await prepareYtDlpCookies();
             try {
+                const cookieArgs = cookiePrep.enabled && cookiePrep.runtimeCookiePath ? ['--cookies', cookiePrep.runtimeCookiePath] : [];
                 const { stdout } = await execFileAsync(engine.path, ['--dump-single-json', '--no-warnings', '--js-runtimes', 'node', ...cookieArgs, testUrl], { timeout: 30000, maxBuffer: 10 * 1024 * 1024 });
                 testResult.durationMs = Date.now() - startTime;
                 testResult.success = true;
@@ -71,6 +75,9 @@ export async function runSelfDiagnostics(testUrl) {
                 testResult.success = false;
                 testResult.exitCode = dumpErr.code ?? 1;
                 testResult.sanitizedStderr = sanitizeStderr(dumpErr.stderr || dumpErr.message);
+            }
+            finally {
+                await cookiePrep.cleanup?.();
             }
             result.testUrlResult = testResult;
         }
