@@ -59,19 +59,30 @@ export async function buildApp(deps) {
     const allowedOrigins = config.WEB_ORIGINS.split(',')
         .map((o) => o.trim().replace(/\/+$/, ''))
         .filter(Boolean);
+    // Production safety net: always allow Vercel frontend and localhost even if WEB_ORIGINS is misconfigured
+    const EXTRA_ALLOWED_ORIGINS = [
+        'https://3ap-video-downloader.vercel.app',
+        'http://localhost:5173',
+        'http://127.0.0.1:5173',
+        'http://localhost:3000',
+    ];
     await app.register(cors, {
         origin: (origin, cb) => {
             if (!origin)
                 return cb(null, true);
             const normalizedOrigin = origin.trim().replace(/\/+$/, '');
-            if (allowedOrigins.includes(normalizedOrigin) || allowedOrigins.includes('*')) {
+            if (allowedOrigins.includes(normalizedOrigin) || allowedOrigins.includes('*') || EXTRA_ALLOWED_ORIGINS.includes(normalizedOrigin)) {
                 return cb(null, true);
             }
+            // Allow any vercel.app preview deployment for this project
+            if (normalizedOrigin.endsWith('.vercel.app'))
+                return cb(null, true);
             return cb(new Error('Not allowed by CORS'), false);
         },
         credentials: false,
         methods: ['GET', 'POST', 'OPTIONS', 'HEAD'],
-        allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'X-Requested-With', 'Range'],
+        allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'X-Requested-With', 'Range', 'x-diagnostic-secret'],
+        exposedHeaders: ['Content-Range', 'Accept-Ranges', 'Content-Length', 'Content-Type', 'Content-Disposition', 'Cache-Control'],
         hideOptionsRoute: false,
     });
     app.addHook('onResponse', async (request, reply) => {
@@ -270,6 +281,7 @@ export async function buildApp(deps) {
         reply.header('content-type', mimeType);
         reply.header('accept-ranges', 'bytes');
         reply.header('cache-control', 'private, no-store');
+        reply.header('access-control-expose-headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition');
         const rangeHeader = request.headers['range'];
         if (rangeHeader && /^bytes=\d*-\d*$/.test(rangeHeader)) {
             const parts = rangeHeader.replace(/bytes=/, '').split('-');
@@ -352,6 +364,8 @@ export async function buildApp(deps) {
         reply.header('content-type', ct);
         reply.header('cache-control', 'public, max-age=3600');
         reply.header('content-length', buf.length);
+        reply.header('access-control-expose-headers', 'Content-Length, Content-Type');
+        reply.header('accept-ranges', 'bytes');
         void reply.code(200);
         return buf;
     }
@@ -362,29 +376,63 @@ export async function buildApp(deps) {
         const resolveId = params.resolveId ?? '';
         const itemId = params.itemId ?? '';
         const formatId = query.format ?? '';
+        const requestId = request.id;
+        const initialRangeHeader = request.headers.range ?? null;
+        const requestHostname = request.hostname;
+        const requestOrigin = request.headers.origin ?? null;
+        // Structured diagnostics — sanitize tokens, log request context
+        log.info('[Stream] incoming request', {
+            requestId,
+            resolveId,
+            itemId,
+            format: formatId || null,
+            requestHostname,
+            requestOrigin,
+            rangeHeader: initialRangeHeader,
+            tokenPresent: !!(query.token),
+            url: request.url.slice(0, 120),
+        });
         if (!/^[0-9a-f-]{36}$/i.test(resolveId) || !itemId || !formatId) {
+            log.warn('[Stream] malformed stream link', { requestId, resolveId, itemId, format: formatId });
             throw appErrors.invalidUrl('Malformed stream link.');
         }
         const token = query.token ?? '';
         const scope = verifyExpiringToken(token, config.DOWNLOAD_TOKEN_SECRET);
         if (!scope || scope !== `${resolveId}:${itemId}:${formatId}`) {
+            log.warn('[Stream] token invalid/expired', { requestId, resolveId, itemId, format: formatId, scopeValid: !!scope });
             throw appErrors.expired('This stream link is invalid or has expired.');
         }
         const record = await store.getResolve(resolveId);
         if (!record) {
+            log.warn('[Stream] resolve record not found (expired)', { requestId, resolveId });
             throw appErrors.expired('This playback session has expired.');
         }
         const item = record.items.find((i) => i.id === itemId);
         if (!item) {
+            log.warn('[Stream] item not found', { requestId, resolveId, itemId });
             throw appErrors.notFound('This item does not exist.');
         }
         const format = item.formats.find((f) => f.formatId === formatId);
         if (!format) {
+            log.warn('[Stream] format not found', { requestId, resolveId, itemId, format: formatId });
             throw appErrors.notFound('This format does not exist.');
         }
         if (!format.playable) {
+            log.warn('[Stream] format not playable', { requestId, resolveId, format: formatId, playable: format.playable });
             throw appErrors.unsupported('This format is not browser-playable.');
         }
+        log.info('[Stream] format resolved', {
+            requestId,
+            resolveId,
+            itemId,
+            format: formatId,
+            platform: record.platform,
+            sourcePlatform: record.platform,
+            playable: format.playable,
+            container: format.container,
+            tokenValid: true,
+            sourceUrlObtained: !!item.sourceUrl,
+        });
         let streamUrl = '';
         let proxyHeaders = {};
         if (record.platform === 'terabox') {
@@ -560,6 +608,7 @@ export async function buildApp(deps) {
                         reply.header('content-type', mimeType);
                         reply.header('content-disposition', 'inline');
                         reply.header('cache-control', 'private, no-store');
+                        reply.header('access-control-expose-headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition');
                         void reply.code(206);
                         return createReadStream(tmpMp4Path, { start, end });
                     }
@@ -569,6 +618,7 @@ export async function buildApp(deps) {
                 reply.header('accept-ranges', 'bytes');
                 reply.header('content-disposition', 'inline');
                 reply.header('cache-control', 'private, no-store');
+                reply.header('access-control-expose-headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition');
                 void reply.code(200);
                 return createReadStream(tmpMp4Path);
             }
@@ -1072,6 +1122,7 @@ export async function buildApp(deps) {
         reply.header('accept-ranges', acceptRanges);
         reply.header('content-disposition', 'inline');
         reply.header('cache-control', 'private, no-store');
+        reply.header('access-control-expose-headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition');
         if (response.status === 206 && contentRange) {
             reply.header('content-range', contentRange);
             if (contentLength) {
@@ -1146,6 +1197,7 @@ export async function buildApp(deps) {
                 reply.header('content-type', mimeType);
                 reply.header('content-disposition', 'inline');
                 reply.header('cache-control', 'private, no-store');
+                reply.header('access-control-expose-headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition');
                 void reply.code(206);
                 const stream = createReadStream(filePath, { start, end });
                 return stream;
@@ -1157,6 +1209,7 @@ export async function buildApp(deps) {
         reply.header('accept-ranges', 'bytes');
         reply.header('content-disposition', 'inline');
         reply.header('cache-control', 'private, no-store');
+        reply.header('access-control-expose-headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition');
         return createReadStream(filePath);
     }
     const sseClients = new Set();
