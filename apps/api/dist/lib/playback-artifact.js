@@ -140,6 +140,9 @@ export async function servePlaybackFile(request, reply, filePath, opts) {
 export async function removeIncompleteArtifact(path) {
     await unlink(path).catch(() => { });
     await unlink(`${path}.incomplete`).catch(() => { });
+    await unlink(`${path}.incomplete.mp4`).catch(() => { });
+    await unlink(path.replace(/\.mp4$/, '.incomplete.mp4')).catch(() => { });
+    await unlink(path.replace(/\.mp4$/, '.transcode.incomplete.mp4')).catch(() => { });
     playbackInFlight.delete(path);
 }
 //# sourceMappingURL=playback-artifact.js.map

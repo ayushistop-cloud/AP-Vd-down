@@ -11,7 +11,7 @@ import { SlidingWindowRateLimiter } from './lib/rate-limit.js';
 import { ResolveService } from './services/resolve-service.js';
 import { JobService } from './services/job-service.js';
 import { jobToView, resolveRecordToView } from './views.js';
-import { getPlaybackArtifactPath, playbackCacheKey, playbackInFlight, isPlaybackArtifactFresh, ensurePlaybackDir, cleanupStalePlaybackArtifacts, } from './lib/playback-artifact.js';
+import { getPlaybackArtifactPath, playbackCacheKey, playbackInFlight, isPlaybackArtifactFresh, ensurePlaybackDir, cleanupStalePlaybackArtifacts, removeIncompleteArtifact, } from './lib/playback-artifact.js';
 function zodToAppError(error) {
     const first = error.issues[0];
     const where = first?.path?.length ? ` (${first.path.map(String).join('.')})` : '';
@@ -520,7 +520,7 @@ export async function buildApp(deps) {
         }
         // Helper: yt-dlp download to file (seekable, no pipe)
         const ytdlpDownloadToFile = async (binary, selector, source, outPath, extraArgs = []) => {
-            const tmp = `${outPath}.incomplete`;
+            const tmp = outPath.endsWith('.mp4') ? outPath.replace(/\.mp4$/, '.incomplete.mp4') : `${outPath}.incomplete.mp4`;
             await ensurePlaybackDir();
             await new Promise((resolve, reject) => {
                 const args = ['--no-warnings', '--no-playlist', ...extraArgs, '--format', selector, '-o', tmp, source];
@@ -552,9 +552,9 @@ export async function buildApp(deps) {
             });
         };
         const ffmpegTranscodeToFile = async (inputPath, outPath, videoArgs, audioArgs) => {
-            const tmp = `${outPath}.transcode.incomplete`;
+            const tmp = outPath.endsWith('.mp4') ? outPath.replace(/\.mp4$/, '.transcode.incomplete.mp4') : `${outPath}.transcode.incomplete.mp4`;
             await new Promise((resolve, reject) => {
-                const args = ['-y', '-i', inputPath, ...videoArgs, ...audioArgs, '-movflags', 'faststart', tmp];
+                const args = ['-y', '-i', inputPath, ...videoArgs, ...audioArgs, '-f', 'mp4', '-movflags', 'faststart', tmp];
                 const proc = spawn('ffmpeg', args);
                 let stderr = '';
                 proc.stderr.on('data', (d) => { stderr += d.toString(); if (stderr.length > 4000)
@@ -581,7 +581,7 @@ export async function buildApp(deps) {
             });
         };
         const ffmpegRemuxUrlsToFile = async (videoUrl, audioUrl, outPath, needsTranscode) => {
-            const tmp = `${outPath}.incomplete`;
+            const tmp = outPath.endsWith('.mp4') ? outPath.replace(/\.mp4$/, '.incomplete.mp4') : `${outPath}.incomplete.mp4`;
             const headerStr = `User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36\r\n${record.platform === 'youtube' ? 'Referer: https://www.youtube.com/\r\n' : ''}`;
             const codecArgs = needsTranscode
                 ? ['-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k']
@@ -716,9 +716,9 @@ export async function buildApp(deps) {
                             const concatList = localSegPaths.map(p => `file '${p.replace(/'/g, "'\\''")}'`).join('\n');
                             const concatPath = `${segDir}/concat.txt`.replace(/\\/g, '/');
                             writeFileSync(concatPath, concatList);
-                            const tmpIncomplete = `${artifactPath}.incomplete`;
+                            const tmpIncomplete = artifactPath.endsWith('.mp4') ? artifactPath.replace(/\.mp4$/, '.incomplete.mp4') : `${artifactPath}.incomplete.mp4`;
                             await new Promise((resolve, reject) => {
-                                const args = ['-f', 'concat', '-safe', '0', '-i', concatPath, '-c', 'copy', '-movflags', 'faststart', '-y', tmpIncomplete];
+                                const args = ['-f', 'concat', '-safe', '0', '-i', concatPath, '-c', 'copy', '-f', 'mp4', '-movflags', 'faststart', '-y', tmpIncomplete];
                                 const proc = spawn('ffmpeg', args);
                                 let stderr = '';
                                 proc.stderr.on('data', d => stderr += d.toString());
@@ -957,7 +957,7 @@ export async function buildApp(deps) {
                         await runDownloadWithStrategy();
                     })();
                     playbackInFlight.set(artifactKey, p);
-                    p.catch(async () => { await unlinkAsync(artifactPath).catch(() => { }); await unlinkAsync(`${artifactPath}.incomplete`).catch(() => { }); });
+                    p.catch(async () => { await removeIncompleteArtifact(artifactPath).catch(() => { }); });
                     p.finally(() => playbackInFlight.delete(artifactKey));
                     try {
                         await p;
@@ -1284,7 +1284,7 @@ export async function buildApp(deps) {
                                     await ffmpegRemuxUrlsToFile(videoUrl, audioUrl, artifactPath, needsTranscode);
                                 })();
                                 playbackInFlight.set(keyIg, pIg);
-                                pIg.catch(async () => { await unlinkAsync(artifactPath).catch(() => { }); await unlinkAsync(`${artifactPath}.incomplete`).catch(() => { }); });
+                                pIg.catch(async () => { await removeIncompleteArtifact(artifactPath).catch(() => { }); });
                                 pIg.finally(() => playbackInFlight.delete(keyIg));
                                 try {
                                     await pIg;

@@ -61,7 +61,7 @@ export function normalizeYtDlpFormats(raw, maxHeight) {
                 hasAudio: true,
                 sourceSelector: sel,
                 playable: true,
-                directPlayCompatible: true,
+                directPlayCompatible: false,
                 mimeType: getMimeType(container, 'audio'),
             };
             if (!bestAudio || (candidate.bitrateKbps ?? 0) > (bestAudio.bitrateKbps ?? 0))

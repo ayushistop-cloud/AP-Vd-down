@@ -22,7 +22,7 @@ export function resolveRecordToView(record, resolveCtx) {
         thumbnailUrl: recordThumb,
         durationSeconds: record.durationSeconds,
         capabilities: record.capabilities,
-        expiresAt: new Date(record.expiresAt).toISOString(),
+        expiresAt: new Date(record.expiresAt || (Date.now() + 900_000)).toISOString(),
         items: record.items.map((item) => {
             const publicFormatsList = (item.formats ?? []).map(({ sourceSelector: _ignored, ...rest }) => {
                 const view = rest;
@@ -34,17 +34,18 @@ export function resolveRecordToView(record, resolveCtx) {
                 }
                 return view;
             });
+            const isAudioItem = publicFormatsList.length > 0 && publicFormatsList.every((f) => f.kind === 'audio');
             const downloadFormats = [...publicFormatsList];
             const directCandidates = publicFormatsList
-                .filter((f) => f.directPlayCompatible === true)
+                .filter((f) => f.directPlayCompatible === true && (isAudioItem || (f.kind !== 'audio' && f.hasVideo !== false)))
                 .sort((a, b) => evaluatePlaybackCandidate(b).compatibilityScore - evaluatePlaybackCandidate(a).compatibilityScore);
             const fallbackCandidates = publicFormatsList
-                .filter((f) => f.playable && f.kind === 'video+audio')
+                .filter((f) => f.playable && (isAudioItem || (f.kind !== 'audio' && f.hasVideo !== false)))
                 .sort((a, b) => evaluatePlaybackCandidate(b).compatibilityScore - evaluatePlaybackCandidate(a).compatibilityScore);
             const playbackCandidates = directCandidates.length > 0 ? directCandidates : fallbackCandidates;
             const recommendedPlaybackFormat = playbackCandidates[0] ??
                 publicFormatsList.find((f) => f.playable && f.kind !== 'audio' && f.container?.toLowerCase() === 'mp4') ??
-                publicFormatsList.find((f) => f.playable);
+                publicFormatsList.find((f) => isAudioItem || (f.playable && f.kind !== 'audio'));
             const playbackFallbackCandidates = playbackCandidates.length > 1 ? playbackCandidates.slice(1) : [];
             // Proxy thumbnail for Terabox
             let itemThumb = item.thumbnailUrl;
