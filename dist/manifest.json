@@ -1,0 +1,16 @@
+{
+  "name": "3AP Video Downloader",
+  "short_name": "3AP",
+  "description": "Anonymous multi-platform media download utility",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#090d16",
+  "theme_color": "#6366f1",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}
