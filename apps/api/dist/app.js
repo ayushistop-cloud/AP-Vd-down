@@ -59,11 +59,6 @@ export async function buildApp(deps) {
         bodyLimit: 16 * 1024,
     });
     /* ── cross-cutting hooks ───────────────────────────────────────────────── */
-    app.addHook('onRequest', async (_request, reply) => {
-        reply.header('x-content-type-options', 'nosniff');
-        reply.header('referrer-policy', 'strict-origin-when-cross-origin');
-        reply.header('x-frame-options', 'DENY');
-    });
     const allowedOrigins = config.WEB_ORIGINS.split(',')
         .map((o) => o.trim().replace(/\/+$/, ''))
         .filter(Boolean);
@@ -74,23 +69,44 @@ export async function buildApp(deps) {
         'http://127.0.0.1:5173',
         'http://localhost:3000',
     ];
+    function isOriginAllowed(origin) {
+        if (!origin)
+            return true;
+        const normalizedOrigin = origin.trim().replace(/\/+$/, '');
+        if (allowedOrigins.includes(normalizedOrigin) || allowedOrigins.includes('*') || EXTRA_ALLOWED_ORIGINS.includes(normalizedOrigin)) {
+            return true;
+        }
+        if (normalizedOrigin.endsWith('.vercel.app'))
+            return true;
+        return false;
+    }
+    function ensureCorsHeaders(request, reply) {
+        const origin = request.headers.origin;
+        if (origin && isOriginAllowed(origin)) {
+            reply.header('access-control-allow-origin', origin);
+            reply.header('access-control-allow-credentials', 'false');
+            reply.header('access-control-allow-methods', 'GET, POST, OPTIONS, HEAD');
+            reply.header('access-control-allow-headers', 'Content-Type, Authorization, Idempotency-Key, X-Requested-With, Range, x-diagnostic-secret');
+            reply.header('access-control-expose-headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition, ETag');
+        }
+    }
+    app.addHook('onRequest', async (request, reply) => {
+        reply.header('x-content-type-options', 'nosniff');
+        reply.header('referrer-policy', 'strict-origin-when-cross-origin');
+        reply.header('x-frame-options', 'DENY');
+        ensureCorsHeaders(request, reply);
+    });
     await app.register(cors, {
         origin: (origin, cb) => {
-            if (!origin)
-                return cb(null, true);
-            const normalizedOrigin = origin.trim().replace(/\/+$/, '');
-            if (allowedOrigins.includes(normalizedOrigin) || allowedOrigins.includes('*') || EXTRA_ALLOWED_ORIGINS.includes(normalizedOrigin)) {
+            if (!origin || isOriginAllowed(origin)) {
                 return cb(null, true);
             }
-            // Allow any vercel.app preview deployment for this project
-            if (normalizedOrigin.endsWith('.vercel.app'))
-                return cb(null, true);
             return cb(new Error('Not allowed by CORS'), false);
         },
         credentials: false,
         methods: ['GET', 'POST', 'OPTIONS', 'HEAD'],
         allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'X-Requested-With', 'Range', 'x-diagnostic-secret'],
-        exposedHeaders: ['Content-Range', 'Accept-Ranges', 'Content-Length', 'Content-Type', 'Content-Disposition', 'Cache-Control'],
+        exposedHeaders: ['Content-Range', 'Accept-Ranges', 'Content-Length', 'Content-Type', 'Content-Disposition', 'ETag', 'Cache-Control'],
         hideOptionsRoute: false,
     });
     app.addHook('onResponse', async (request, reply) => {
@@ -455,12 +471,59 @@ export async function buildApp(deps) {
         const genStartTime = Date.now();
         let clientDisconnected = false;
         request.raw.on('close', () => { clientDisconnected = true; });
+        // Early HEAD request handler: NEVER start yt-dlp/ffmpeg generation on HEAD
+        if (request.method === 'HEAD') {
+            const earlyStat = await stat(artifactPath).catch(() => null);
+            if (!isPlaybackArtifactFresh(earlyStat)) {
+                log.info('[Stream] HEAD missing artifact — returning 404 without generation', { resolveId, itemId, formatId });
+                reply.header('content-type', 'video/mp4');
+                reply.header('accept-ranges', 'bytes');
+                reply.header('access-control-expose-headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition, ETag');
+                throw appErrors.notFound('Playback artifact missing.');
+            }
+            const size = earlyStat.size;
+            const etag = `"${earlyStat.mtimeMs.toString(36)}-${size.toString(36)}"`;
+            const rangeHeader = initialRangeHeader ?? request.headers.range;
+            const rangeParse = (() => {
+                if (!rangeHeader || !rangeHeader.startsWith('bytes='))
+                    return { isRange: false, valid: true, start: 0, end: size - 1 };
+                const m = /bytes=(\d*)-(\d*)/.exec(rangeHeader);
+                if (!m)
+                    return { isRange: true, valid: false, start: 0, end: 0 };
+                const s = m[1] ? parseInt(m[1], 10) : 0;
+                const e = m[2] ? parseInt(m[2], 10) : size - 1;
+                if (Number.isNaN(s) || Number.isNaN(e) || s >= size || e >= size || s > e)
+                    return { isRange: true, valid: false, start: s, end: e };
+                return { isRange: true, valid: true, start: s, end: e };
+            })();
+            reply.header('content-type', 'video/mp4');
+            reply.header('accept-ranges', 'bytes');
+            reply.header('content-disposition', 'inline');
+            reply.header('cache-control', 'private, no-store');
+            reply.header('etag', etag);
+            reply.header('access-control-expose-headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition, ETag');
+            if (rangeParse.isRange && !rangeParse.valid) {
+                reply.header('content-range', `bytes */${size}`);
+                void reply.code(416);
+                return reply.send('');
+            }
+            if (rangeParse.isRange && rangeParse.valid) {
+                const chunkSize = rangeParse.end - rangeParse.start + 1;
+                reply.header('content-range', `bytes ${rangeParse.start}-${rangeParse.end}/${size}`);
+                reply.header('content-length', chunkSize);
+                void reply.code(206);
+                return reply.send('');
+            }
+            reply.header('content-length', size);
+            void reply.code(200);
+            return reply.send('');
+        }
         // Helper: yt-dlp download to file (seekable, no pipe)
-        const ytdlpDownloadToFile = async (binary, selector, source, outPath) => {
+        const ytdlpDownloadToFile = async (binary, selector, source, outPath, extraArgs = []) => {
             const tmp = `${outPath}.incomplete`;
             await ensurePlaybackDir();
             await new Promise((resolve, reject) => {
-                const args = ['--no-warnings', '--no-playlist', '--format', selector, '-o', tmp, source];
+                const args = ['--no-warnings', '--no-playlist', ...extraArgs, '--format', selector, '-o', tmp, source];
                 const proc = spawn(binary, args);
                 let stderr = '';
                 proc.stderr.on('data', (d) => { stderr += d.toString(); if (stderr.length > 4000)
@@ -480,11 +543,12 @@ export async function buildApp(deps) {
                     }
                     else {
                         await unlinkAsync(tmp).catch(() => { });
-                        reject(appErrors.temporaryProviderError(`yt-dlp download failed (code ${code}): ${stderr.slice(-600)}`));
+                        const err = appErrors.temporaryProviderError(`yt-dlp download failed (code ${code}): ${stderr.slice(-600)}`);
+                        err.stderrTail = stderr;
+                        reject(err);
                     }
                 });
                 proc.on('error', (e) => reject(toAppError(e)));
-                // Do not kill on client disconnect — artifact is reusable; keep generating for cache
             });
         };
         const ffmpegTranscodeToFile = async (inputPath, outPath, videoArgs, audioArgs) => {
@@ -758,12 +822,13 @@ export async function buildApp(deps) {
             streamUrl = sel;
         }
         else if (record.platform === 'tiktok') {
-            // ── TikTok unified artifact (no stdout pipe) ──
+            // ── TikTok unified artifact with 3-stage fallback pipeline ──
             const binary = await requireBinary(process.env.YT_DLP_PATH, log);
             const rawFormatId = (format.sourceSelector ?? format.formatId).replace(/^[vfa]:/, '');
             const isByteVc1 = rawFormatId.includes('bytevc1') || rawFormatId.includes('hevc') || rawFormatId.includes('h265');
-            const selector = isByteVc1 ? `${rawFormatId}/best` : `${rawFormatId}[vcodec^=h264]/${rawFormatId}[vcodec^=avc]/b[vcodec^=h264]/b[vcodec^=avc]/download/best`;
+            const selector = isByteVc1 ? `${rawFormatId}/best` : (rawFormatId.startsWith('http') ? 'best' : `${rawFormatId}[vcodec^=h264]/${rawFormatId}[vcodec^=avc]/b[vcodec^=h264]/b[vcodec^=avc]/download/best`);
             const existing = await stat(artifactPath).catch(() => null);
+            let tiktokStrategy = 'yt-dlp';
             if (isPlaybackArtifactFresh(existing)) {
                 artifactCacheHit = true;
                 artifactStatus = 'HIT';
@@ -771,36 +836,125 @@ export async function buildApp(deps) {
             else {
                 if (!playbackInFlight.has(artifactKey)) {
                     const p = (async () => {
-                        if (isByteVc1) {
-                            const hevcTmp = `${artifactPath}.hevc.tmp.mp4`;
-                            await ytdlpDownloadToFile(binary, selector, item.sourceUrl, hevcTmp);
-                            // Transcode HEVC → H264/AAC
-                            const tmpIncomplete = `${artifactPath}.incomplete`;
-                            await new Promise((resolve, reject) => {
-                                const args = ['-y', '-i', hevcTmp, '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-c:a', 'copy', '-movflags', 'faststart', tmpIncomplete];
-                                const proc = spawn('ffmpeg', args);
-                                let stderr = '';
-                                proc.stderr.on('data', d => stderr += d.toString());
-                                proc.on('close', async (code) => {
-                                    await unlinkAsync(hevcTmp).catch(() => { });
-                                    if (code === 0) {
-                                        const st = await stat(tmpIncomplete).catch(() => null);
-                                        if (!st || st.size < 1024)
-                                            return reject(appErrors.temporaryProviderError('Transcoded artifact too small'));
-                                        await rename(tmpIncomplete, artifactPath);
-                                        resolve();
-                                    }
-                                    else {
-                                        await unlinkAsync(tmpIncomplete).catch(() => { });
-                                        reject(appErrors.temporaryProviderError(`ByteVC1 transcode failed (code ${code}): ${stderr.slice(-500)}`));
-                                    }
+                        const runDownloadWithStrategy = async () => {
+                            // Strategy 1: Primary yt-dlp extraction
+                            tiktokStrategy = 'yt-dlp';
+                            log.info('[Stream] TikTok extraction attempt', { resolveId, itemId, formatId, tiktokStrategy });
+                            try {
+                                if (isByteVc1) {
+                                    const hevcTmp = `${artifactPath}.hevc.tmp.mp4`;
+                                    await ytdlpDownloadToFile(binary, selector, item.sourceUrl, hevcTmp);
+                                    const tmpIncomplete = `${artifactPath}.incomplete`;
+                                    await new Promise((res, rej) => {
+                                        const args = ['-y', '-i', hevcTmp, '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-c:a', 'copy', '-movflags', 'faststart', tmpIncomplete];
+                                        const proc = spawn('ffmpeg', args);
+                                        let stderr = '';
+                                        proc.stderr.on('data', d => stderr += d.toString());
+                                        proc.on('close', async (code) => {
+                                            await unlinkAsync(hevcTmp).catch(() => { });
+                                            if (code === 0) {
+                                                const st = await stat(tmpIncomplete).catch(() => null);
+                                                if (!st || st.size < 1024)
+                                                    return rej(appErrors.temporaryProviderError('Transcoded artifact too small'));
+                                                await rename(tmpIncomplete, artifactPath);
+                                                res();
+                                            }
+                                            else {
+                                                await unlinkAsync(tmpIncomplete).catch(() => { });
+                                                rej(appErrors.temporaryProviderError(`ByteVC1 transcode failed (code ${code}): ${stderr.slice(-500)}`));
+                                            }
+                                        });
+                                        proc.on('error', e => rej(toAppError(e)));
+                                    });
+                                }
+                                else {
+                                    await ytdlpDownloadToFile(binary, selector, item.sourceUrl, artifactPath);
+                                }
+                                log.info('[Stream] TikTok extraction succeeded', { resolveId, itemId, formatId, tiktokStrategy });
+                                return;
+                            }
+                            catch (primaryErr) {
+                                const stderrTail = String(primaryErr?.stderrTail || primaryErr?.message || '');
+                                log.warn('[Stream] TikTok primary yt-dlp strategy failed', {
+                                    resolveId,
+                                    itemId,
+                                    formatId,
+                                    tiktokStrategy,
+                                    failureClassification: 'YTDLP_EXTRACTOR_FAILED',
+                                    stderrTail: stderrTail.slice(-500),
                                 });
-                                proc.on('error', e => reject(toAppError(e)));
-                            });
-                        }
-                        else {
-                            await ytdlpDownloadToFile(binary, selector, item.sourceUrl, artifactPath);
-                        }
+                                // Check if resolve phase provided a direct CDN HTTP URL
+                                const directUrlCandidate = (format.sourceSelector && /^https?:\/\//i.test(format.sourceSelector))
+                                    ? format.sourceSelector
+                                    : (item.sourceUrl && /^https?:\/\//i.test(item.sourceUrl) && /\.(mp4|mov)/i.test(item.sourceUrl))
+                                        ? item.sourceUrl
+                                        : null;
+                                if (directUrlCandidate) {
+                                    tiktokStrategy = 'resolved-direct-url';
+                                    log.info('[Stream] TikTok attempting direct-url fallback', { resolveId, itemId, formatId, tiktokStrategy, directUrl: directUrlCandidate.slice(0, 60) });
+                                    try {
+                                        const tmpIncomplete = `${artifactPath}.incomplete`;
+                                        const res = await fetch(directUrlCandidate, {
+                                            headers: {
+                                                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                                                'Referer': 'https://www.tiktok.com/',
+                                            },
+                                        });
+                                        if (!res.ok && res.status !== 206) {
+                                            throw new Error(`Direct CDN fetch returned HTTP ${res.status}`);
+                                        }
+                                        const cType = res.headers.get('content-type') || '';
+                                        if (cType.includes('text/html') || cType.includes('json')) {
+                                            throw new Error(`Direct CDN fetch returned unexpected content-type ${cType}`);
+                                        }
+                                        const buf = Buffer.from(await res.arrayBuffer());
+                                        if (buf.length < 1024) {
+                                            throw new Error(`Direct CDN fetch payload too small (${buf.length} bytes)`);
+                                        }
+                                        writeFileSync(tmpIncomplete, buf);
+                                        await rename(tmpIncomplete, artifactPath);
+                                        log.info('[Stream] TikTok direct-url fallback succeeded', { resolveId, itemId, formatId, tiktokStrategy, bytes: buf.length });
+                                        return;
+                                    }
+                                    catch (directUrlErr) {
+                                        log.warn('[Stream] TikTok direct-url fallback failed', {
+                                            resolveId,
+                                            itemId,
+                                            formatId,
+                                            tiktokStrategy,
+                                            failureClassification: 'DIRECT_URL_FETCH_FAILED',
+                                            error: directUrlErr?.message,
+                                        });
+                                    }
+                                }
+                                // Strategy 3: TikTok yt-dlp fallback attempt with browser User-Agent & Referer
+                                tiktokStrategy = 'fallback';
+                                log.info('[Stream] TikTok attempting yt-dlp fallback strategy with browser headers', { resolveId, itemId, formatId, tiktokStrategy });
+                                const fallbackArgs = [
+                                    '--user-agent',
+                                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                                    '--referer',
+                                    'https://www.tiktok.com/',
+                                ];
+                                try {
+                                    await ytdlpDownloadToFile(binary, selector, item.sourceUrl, artifactPath, fallbackArgs);
+                                    log.info('[Stream] TikTok fallback strategy succeeded', { resolveId, itemId, formatId, tiktokStrategy });
+                                    return;
+                                }
+                                catch (fallbackErr) {
+                                    log.error('[Stream] All TikTok extraction strategies failed', {
+                                        resolveId,
+                                        itemId,
+                                        formatId,
+                                        tiktokStrategy,
+                                        failureClassification: 'ALL_TIKTOK_STRATEGIES_FAILED',
+                                        error: fallbackErr?.message,
+                                    });
+                                    throw fallbackErr;
+                                }
+                            }
+                        };
+                        await runDownloadWithStrategy();
                     })();
                     playbackInFlight.set(artifactKey, p);
                     p.catch(async () => { await unlinkAsync(artifactPath).catch(() => { }); await unlinkAsync(`${artifactPath}.incomplete`).catch(() => { }); });
@@ -837,17 +991,17 @@ export async function buildApp(deps) {
                     return { isRange: true, valid: false, start: s, end: e };
                 return { isRange: true, valid: true, start: s, end: e };
             })();
-            log.info('[Stream] playback artifact serve', { platform: 'tiktok', resolveId, itemId, formatId, range: rangeHeader ?? 'none', artifactStatus, generationMs: artifactGenerationMs, cacheHit: artifactCacheHit, size, httpStatus: !rangeParse.isRange ? 200 : !rangeParse.valid ? 416 : 206, contentType: 'video/mp4', contentLength: rangeParse.isRange && rangeParse.valid ? (rangeParse.end - rangeParse.start + 1) : size, contentRange: rangeParse.isRange && rangeParse.valid ? `bytes ${rangeParse.start}-${rangeParse.end}/${size}` : 'none', firstByteMs: artifactGenerationMs, disconnectState: clientDisconnected, isByteVc1 });
+            log.info('[Stream] playback artifact serve', { platform: 'tiktok', resolveId, itemId, formatId, tiktokStrategy, range: rangeHeader ?? 'none', artifactStatus, generationMs: artifactGenerationMs, cacheHit: artifactCacheHit, size, httpStatus: !rangeParse.isRange ? 200 : !rangeParse.valid ? 416 : 206, contentType: 'video/mp4', contentLength: rangeParse.isRange && rangeParse.valid ? (rangeParse.end - rangeParse.start + 1) : size, contentRange: rangeParse.isRange && rangeParse.valid ? `bytes ${rangeParse.start}-${rangeParse.end}/${size}` : 'none', firstByteMs: artifactGenerationMs, disconnectState: clientDisconnected, isByteVc1 });
             reply.header('content-type', 'video/mp4');
             reply.header('accept-ranges', 'bytes');
             reply.header('content-disposition', 'inline');
             reply.header('cache-control', 'private, no-store');
-            reply.header('access-control-expose-headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition');
+            reply.header('access-control-expose-headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition, ETag');
             if (rangeParse.isRange && !rangeParse.valid) {
                 reply.header('content-range', `bytes */${size}`);
                 void reply.code(416);
                 if (isHead)
-                    return;
+                    return reply.send('');
                 return;
             }
             if (rangeParse.isRange && rangeParse.valid) {
@@ -856,13 +1010,13 @@ export async function buildApp(deps) {
                 reply.header('content-length', chunkSize);
                 void reply.code(206);
                 if (isHead)
-                    return;
+                    return reply.send('');
                 return createReadStream(artifactPath, { start: rangeParse.start, end: rangeParse.end });
             }
             reply.header('content-length', size);
             void reply.code(200);
             if (isHead)
-                return;
+                return reply.send('');
             return createReadStream(artifactPath);
         }
         else {
@@ -1384,6 +1538,7 @@ export async function buildApp(deps) {
         if (!mimeType) {
             throw appErrors.unsupported('This file type cannot be played in the browser.');
         }
+        const isHead = request.method === 'HEAD';
         // Handle Range requests for seeking
         const rangeHeader = request.headers.range;
         if (rangeHeader) {
@@ -1395,6 +1550,8 @@ export async function buildApp(deps) {
                 if (start >= info.size || end >= info.size || chunkSize <= 0) {
                     reply.header('content-range', `bytes */${info.size}`);
                     void reply.code(416);
+                    if (isHead)
+                        return reply.send('');
                     return;
                 }
                 reply.header('content-range', `bytes ${start}-${end}/${info.size}`);
@@ -1403,8 +1560,10 @@ export async function buildApp(deps) {
                 reply.header('content-type', mimeType);
                 reply.header('content-disposition', 'inline');
                 reply.header('cache-control', 'private, no-store');
-                reply.header('access-control-expose-headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition');
+                reply.header('access-control-expose-headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition, ETag');
                 void reply.code(206);
+                if (isHead)
+                    return reply.send('');
                 const stream = createReadStream(filePath, { start, end });
                 return stream;
             }
@@ -1415,7 +1574,10 @@ export async function buildApp(deps) {
         reply.header('accept-ranges', 'bytes');
         reply.header('content-disposition', 'inline');
         reply.header('cache-control', 'private, no-store');
-        reply.header('access-control-expose-headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition');
+        reply.header('access-control-expose-headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition, ETag');
+        void reply.code(200);
+        if (isHead)
+            return reply.send('');
         return createReadStream(filePath);
     }
     const sseClients = new Set();
@@ -1587,10 +1749,13 @@ export async function buildApp(deps) {
     }
     /* ── error surface ─────────────────────────────────────────────────────── */
     app.setErrorHandler((rawError, request, reply) => {
+        ensureCorsHeaders(request, reply);
         const error = rawError;
         if (error.validation) {
             const err = appErrors.validation(String(error.message ?? 'Invalid request.'));
             void reply.code(err.httpStatus);
+            if (request.method === 'HEAD')
+                return reply.send('');
             return { error: err.toJSON() };
         }
         const appErr = toAppError(rawError);
@@ -1613,9 +1778,12 @@ export async function buildApp(deps) {
             });
         }
         void reply.code(status);
+        if (request.method === 'HEAD')
+            return reply.send('');
         return { error: appErr.toJSON() };
     });
     app.setNotFoundHandler((request, reply) => {
+        ensureCorsHeaders(request, reply);
         const rawPath = request.url.split('?')[0] ?? '';
         const cleanPath = rawPath.replace(/\/+$/, '') || '/';
         let msg = `Route ${request.method} ${cleanPath} not found.`;
@@ -1624,6 +1792,8 @@ export async function buildApp(deps) {
         }
         const err = appErrors.notFound(msg);
         void reply.code(404);
+        if (request.method === 'HEAD')
+            return reply.send('');
         return { error: err.toJSON() };
     });
     return app;

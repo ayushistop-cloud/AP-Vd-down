@@ -42,6 +42,7 @@ export function normalizeYtDlpFormats(raw, maxHeight) {
             continue;
         const container = (f.ext ?? 'mp4').replace(/[^a-z0-9]/gi, '') || 'mp4';
         const protocol = f.protocol ?? 'https';
+        const sel = (f.url && /^https?:\/\//i.test(f.url)) ? f.url : f.format_id;
         if (!hasVideo) {
             // audio-only candidate
             const candidate = {
@@ -58,7 +59,7 @@ export function normalizeYtDlpFormats(raw, maxHeight) {
                 audioCodec: acodec,
                 hasVideo: false,
                 hasAudio: true,
-                sourceSelector: f.format_id,
+                sourceSelector: sel,
                 playable: true,
                 directPlayCompatible: true,
                 mimeType: getMimeType(container, 'audio'),
@@ -94,7 +95,7 @@ export function normalizeYtDlpFormats(raw, maxHeight) {
             bitrateKbps: Math.round(f.tbr ?? 0) || undefined,
             estimatedSizeBytes: f.filesize ?? f.filesize_approx,
             filesizeApprox: f.filesize_approx,
-            sourceSelector: f.format_id,
+            sourceSelector: sel,
             playable: isPlayable,
             directPlayCompatible,
             mimeType: getMimeType(container, kind),

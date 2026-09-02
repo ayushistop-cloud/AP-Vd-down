@@ -5,6 +5,7 @@ export { getBestPlayableStream };
  */
 export interface YtDlpFormatJson {
     format_id?: string;
+    url?: string;
     format_note?: string;
     ext?: string;
     vcodec?: string;
