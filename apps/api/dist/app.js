@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { createReadStream, writeFileSync, unlinkSync, mkdirSync, rmSync } from 'node:fs';
-import { stat } from 'node:fs/promises';
+import { stat, rename, unlink as unlinkAsync } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import Fastify from 'fastify';
@@ -11,6 +11,7 @@ import { SlidingWindowRateLimiter } from './lib/rate-limit.js';
 import { ResolveService } from './services/resolve-service.js';
 import { JobService } from './services/job-service.js';
 import { jobToView, resolveRecordToView } from './views.js';
+import { getPlaybackArtifactPath, playbackCacheKey, playbackInFlight, isPlaybackArtifactFresh, ensurePlaybackDir, cleanupStalePlaybackArtifacts, } from './lib/playback-artifact.js';
 function zodToAppError(error) {
     const first = error.issues[0];
     const where = first?.path?.length ? ` (${first.path.map(String).join('.')})` : '';
@@ -26,6 +27,13 @@ export async function buildApp(deps) {
         cookiesReadable: cookieStartup.cookiesReadable,
         configuredPath: cookieStartup.configuredPath,
     });
+    await ensurePlaybackDir();
+    // Periodic playback artifact GC — never deletes active streams
+    const playbackGcTimer = setInterval(() => {
+        cleanupStalePlaybackArtifacts(log).catch(() => { });
+    }, 5 * 60 * 1000);
+    // Allow process to exit cleanly in tests
+    playbackGcTimer.unref?.();
     const resolveService = new ResolveService(adapters, store, {
         resolveTtlMs: config.RESOLVE_TTL_MINUTES * 60_000,
         ipPepper: config.IP_HASH_PEPPER,
@@ -290,7 +298,7 @@ export async function buildApp(deps) {
             if (isNaN(start) || isNaN(end) || start >= info.size || end >= info.size || start > end) {
                 reply.header('content-range', `bytes */${info.size}`);
                 void reply.code(416);
-                return { error: { code: 'INVALID_RANGE', message: 'Requested range not satisfiable' } };
+                return;
             }
             const chunkSize = end - start + 1;
             reply.header('content-range', `bytes ${start}-${end}/${info.size}`);
@@ -433,267 +441,482 @@ export async function buildApp(deps) {
             tokenValid: true,
             sourceUrlObtained: !!item.sourceUrl,
         });
+        // ── Unified browser-compatible artifact pipeline ─────────────────────
+        // All direct-play media is materialized to a seekable MP4 artifact and served via Range.
+        // This fixes TikTok bytes=0- disconnect (unseekable pipe), Instagram/Facebook CDN non-Range, Terabox HLS.
         let streamUrl = '';
         let proxyHeaders = {};
+        const artifactKey = playbackCacheKey(resolveId, itemId, formatId);
+        const artifactPath = getPlaybackArtifactPath(resolveId, itemId, formatId);
+        let artifactGenerationMs = 0;
+        let artifactCacheHit = false;
+        let artifactStatus = 'MISS';
+        let firstByteMs = null;
+        const genStartTime = Date.now();
+        let clientDisconnected = false;
+        request.raw.on('close', () => { clientDisconnected = true; });
+        // Helper: yt-dlp download to file (seekable, no pipe)
+        const ytdlpDownloadToFile = async (binary, selector, source, outPath) => {
+            const tmp = `${outPath}.incomplete`;
+            await ensurePlaybackDir();
+            await new Promise((resolve, reject) => {
+                const args = ['--no-warnings', '--no-playlist', '--format', selector, '-o', tmp, source];
+                const proc = spawn(binary, args);
+                let stderr = '';
+                proc.stderr.on('data', (d) => { stderr += d.toString(); if (stderr.length > 4000)
+                    stderr = stderr.slice(-4000); });
+                proc.on('close', async (code) => {
+                    if (code === 0) {
+                        try {
+                            const st = await stat(tmp);
+                            if (!st || st.size < 1024)
+                                return reject(appErrors.temporaryProviderError('Downloaded artifact too small'));
+                            await rename(tmp, outPath);
+                            resolve();
+                        }
+                        catch (e) {
+                            reject(toAppError(e));
+                        }
+                    }
+                    else {
+                        await unlinkAsync(tmp).catch(() => { });
+                        reject(appErrors.temporaryProviderError(`yt-dlp download failed (code ${code}): ${stderr.slice(-600)}`));
+                    }
+                });
+                proc.on('error', (e) => reject(toAppError(e)));
+                // Do not kill on client disconnect — artifact is reusable; keep generating for cache
+            });
+        };
+        const ffmpegTranscodeToFile = async (inputPath, outPath, videoArgs, audioArgs) => {
+            const tmp = `${outPath}.transcode.incomplete`;
+            await new Promise((resolve, reject) => {
+                const args = ['-y', '-i', inputPath, ...videoArgs, ...audioArgs, '-movflags', 'faststart', tmp];
+                const proc = spawn('ffmpeg', args);
+                let stderr = '';
+                proc.stderr.on('data', (d) => { stderr += d.toString(); if (stderr.length > 4000)
+                    stderr = stderr.slice(-4000); });
+                proc.on('close', async (code) => {
+                    if (code === 0) {
+                        try {
+                            const st = await stat(tmp);
+                            if (!st || st.size < 1024)
+                                return reject(appErrors.temporaryProviderError('Transcoded artifact too small'));
+                            await rename(tmp, outPath);
+                            resolve();
+                        }
+                        catch (e) {
+                            reject(toAppError(e));
+                        }
+                    }
+                    else {
+                        await unlinkAsync(tmp).catch(() => { });
+                        reject(appErrors.temporaryProviderError(`FFmpeg transcode failed (code ${code}): ${stderr.slice(-600)}`));
+                    }
+                });
+                proc.on('error', (e) => reject(toAppError(e)));
+            });
+        };
+        const ffmpegRemuxUrlsToFile = async (videoUrl, audioUrl, outPath, needsTranscode) => {
+            const tmp = `${outPath}.incomplete`;
+            const headerStr = `User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36\r\n${record.platform === 'youtube' ? 'Referer: https://www.youtube.com/\r\n' : ''}`;
+            const codecArgs = needsTranscode
+                ? ['-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k']
+                : ['-c:v', 'copy', '-c:a', 'copy'];
+            const inputs = [];
+            if (videoUrl)
+                inputs.push('-headers', headerStr, '-i', videoUrl);
+            if (audioUrl)
+                inputs.push('-headers', headerStr, '-i', audioUrl);
+            const args = [...inputs, ...codecArgs, '-f', 'mp4', '-movflags', 'faststart', '-y', tmp];
+            await new Promise((resolve, reject) => {
+                const proc = spawn('ffmpeg', args);
+                let stderr = '';
+                proc.stderr.on('data', (d) => { stderr += d.toString(); if (stderr.length > 4000)
+                    stderr = stderr.slice(-4000); });
+                proc.on('close', async (code) => {
+                    if (code === 0) {
+                        try {
+                            const st = await stat(tmp);
+                            if (!st || st.size < 1024)
+                                return reject(appErrors.temporaryProviderError('Remuxed artifact too small'));
+                            await rename(tmp, outPath);
+                            resolve();
+                        }
+                        catch (e) {
+                            reject(toAppError(e));
+                        }
+                    }
+                    else {
+                        await unlinkAsync(tmp).catch(() => { });
+                        reject(appErrors.temporaryProviderError(`FFmpeg remux failed (code ${code}): ${stderr.slice(-600)}`));
+                    }
+                });
+                proc.on('error', (e) => reject(toAppError(e)));
+            });
+        };
+        // ── Terabox HLS (special) → artifact via same unified path ─────
         if (record.platform === 'terabox') {
-            streamUrl = format.sourceSelector ?? '';
-            if (streamUrl.includes('/share/streaming')) {
-                // Terabox HLS requires careful handling: playlist + segments need same cookies/referer,
-                // and browser needs seekable MP4 with correct Range support. We generate a temp MP4
-                // file via ffmpeg from locally-fetched segments, then serve it with Range (like handleStream).
-                const u = new URL(streamUrl);
+            const sel = format.sourceSelector ?? '';
+            if (sel.includes('/share/streaming')) {
+                const u = new URL(sel);
                 const randsk = u.searchParams.get('randsk') ?? '';
                 const browserid = u.searchParams.get('browserid') ?? '';
                 const shortKeyMatch = /\/sharing\/link\?surl=([\w-]+)/i.exec(item.sourceUrl) || /\/s\/1([\w-]+)/i.exec(item.sourceUrl) || /\/s\/([\w-]+)/i.exec(item.sourceUrl);
                 const shortKey = shortKeyMatch?.[1] ?? '';
                 const cookiesWithBoxClnd = `browserid=${browserid}; BOXCLND=${randsk}`;
                 const referer = `https://${u.hostname}/sharing/link?surl=${shortKey}`;
-                // Use a cache key per resolve so repeated Range requests reuse the same file
-                const cacheKey = `terabox-play-${resolveId}-${itemId}.mp4`;
-                const tmpMp4Path = `${tmpdir()}/${cacheKey}`.replace(/\\/g, '/');
-                let fileInfo = await stat(tmpMp4Path).catch(() => null);
-                const needsGenerate = !fileInfo || Date.now() - fileInfo.mtimeMs > 10 * 60 * 1000 || fileInfo.size < 1024;
-                if (needsGenerate) {
-                    const segHeaders = {
-                        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                        'accept': '*/*',
-                        'referer': referer,
-                        'cookie': cookiesWithBoxClnd,
-                    };
-                    const baseU = new URL(streamUrl);
-                    const uk = baseU.searchParams.get('uk') ?? '';
-                    const shareid = baseU.searchParams.get('shareid') ?? '';
-                    const fid = baseU.searchParams.get('fid') ?? '';
-                    const jsToken = baseU.searchParams.get('jsToken') ?? '';
-                    const segUrls = [];
-                    const seenSegSet = new Set();
-                    let hasMoreSegs = true;
-                    let segAttempts = 0;
-                    while (hasMoreSegs && segAttempts < 1500) {
-                        segAttempts++;
-                        const nowTime = Math.floor(Date.now() / 1000);
-                        const clienttype = '0';
-                        const channel = 'dubox';
-                        const msg = `${clienttype}${channel}${browserid}${nowTime}`;
-                        const saltKey = 'iuuPc64E4Fhn0rTXEzrnbLph0o5qyEEa';
-                        const loopSig = crypto.createHmac('sha1', saltKey).update(msg).digest('hex');
-                        const loopParams = new URLSearchParams({
-                            uk,
-                            shareid,
-                            type: 'M3U8_AUTO_480',
-                            fid,
-                            sign: loopSig,
-                            timestamp: String(nowTime),
-                            ...(jsToken ? { jsToken } : {}),
-                            esl: '1',
-                            isplayer: '1',
-                            ehps: '1',
-                            clienttype,
-                            app_id: '250528',
-                            channel,
-                            randsk,
-                            browserid,
-                        });
-                        const loopUrl = `https://${u.hostname}/share/streaming?${loopParams.toString()}`;
-                        const playlistRes = await fetch(loopUrl, { headers: segHeaders });
-                        if (!playlistRes.ok)
-                            break;
-                        const text = await playlistRes.text();
-                        if (text.includes('errno') || !text.includes('#EXTINF:')) {
-                            hasMoreSegs = false;
-                            break;
-                        }
-                        const lines = text.split('\n').map((l) => l.trim()).filter((l) => l.startsWith('http'));
-                        let addedCount = 0;
-                        for (const seg of lines) {
-                            // Strip ephemeral timestamp parameters to accurately deduplicate segment resources
-                            const baseSegUrl = seg.split('&t=')[0] ?? seg;
-                            if (!seenSegSet.has(baseSegUrl)) {
-                                seenSegSet.add(baseSegUrl);
-                                segUrls.push(seg);
-                                addedCount++;
-                            }
-                        }
-                        if (addedCount === 0 || text.includes('#EXT-X-ENDLIST')) {
-                            hasMoreSegs = false;
-                        }
-                    }
-                    if (segUrls.length === 0)
-                        throw appErrors.temporaryProviderError('Playlist contains no segments.');
-                    const segDir = `${tmpdir()}/terabox-seg-${resolveId}-${itemId}`.replace(/\\/g, '/');
-                    try {
-                        mkdirSync(segDir, { recursive: true });
-                    }
-                    catch { /* ignore */ }
-                    const localSegPaths = new Array(segUrls.length);
-                    // Fetch segment files in controlled parallel batches (5 concurrent downloads) to avoid Terabox CDN throttling
-                    const sBatchSize = 5;
-                    for (let i = 0; i < segUrls.length; i += sBatchSize) {
-                        const batch = segUrls.slice(i, i + sBatchSize);
-                        await Promise.all(batch.map(async (segUrl, idxInBatch) => {
-                            const globalIdx = i + idxInBatch;
-                            const segRes = await fetch(segUrl, { headers: segHeaders });
-                            if (!segRes.ok)
-                                throw appErrors.temporaryProviderError(`Failed to fetch segment ${globalIdx}`);
-                            const buf = Buffer.from(await segRes.arrayBuffer());
-                            if (buf.length < 100)
-                                throw appErrors.temporaryProviderError('Segment too small, likely provider error page.');
-                            const head = buf.slice(0, 200).toString('utf8');
-                            if (head.includes('<!DOCTYPE') || head.includes('"errno"'))
-                                throw appErrors.temporaryProviderError('Provider returned error for segment.');
-                            const segPath = `${segDir}/seg-${String(globalIdx).padStart(5, '0')}.ts`.replace(/\\/g, '/');
-                            writeFileSync(segPath, buf);
-                            localSegPaths[globalIdx] = segPath;
-                        }));
-                    }
-                    // Create concat list for ffmpeg
-                    const concatList = localSegPaths.map(p => `file '${p.replace(/'/g, "'\\''")}'`).join('\n');
-                    const concatPath = `${segDir}/concat.txt`.replace(/\\/g, '/');
-                    writeFileSync(concatPath, concatList);
-                    // Transmux TS segments to MP4 with faststart, stream copy (no re-encode)
-                    await new Promise((resolve, reject) => {
-                        const args = ['-f', 'concat', '-safe', '0', '-i', concatPath, '-c', 'copy', '-movflags', 'faststart', '-y', tmpMp4Path];
-                        const proc = spawn('ffmpeg', args);
-                        let stderr = '';
-                        proc.stderr.on('data', d => stderr += d.toString());
-                        proc.on('close', code => {
-                            // Cleanup segment files but keep mp4
-                            try {
-                                localSegPaths.forEach(p => { try {
-                                    unlinkSync(p);
+                const existing = await stat(artifactPath).catch(() => null);
+                if (isPlaybackArtifactFresh(existing)) {
+                    artifactCacheHit = true;
+                    artifactStatus = 'HIT';
+                }
+                else {
+                    if (!playbackInFlight.has(artifactKey)) {
+                        const p = (async () => {
+                            const segHeaders = {
+                                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                                'accept': '*/*',
+                                'referer': referer,
+                                'cookie': cookiesWithBoxClnd,
+                            };
+                            const baseU = new URL(sel);
+                            const uk = baseU.searchParams.get('uk') ?? '';
+                            const shareid = baseU.searchParams.get('shareid') ?? '';
+                            const fid = baseU.searchParams.get('fid') ?? '';
+                            const jsToken = baseU.searchParams.get('jsToken') ?? '';
+                            const segUrls = [];
+                            const seenSegSet = new Set();
+                            let hasMoreSegs = true;
+                            let segAttempts = 0;
+                            while (hasMoreSegs && segAttempts < 1500) {
+                                segAttempts++;
+                                const nowTime = Math.floor(Date.now() / 1000);
+                                const clienttype = '0';
+                                const channel = 'dubox';
+                                const msg = `${clienttype}${channel}${browserid}${nowTime}`;
+                                const saltKey = 'iuuPc64E4Fhn0rTXEzrnbLph0o5qyEEa';
+                                const loopSig = crypto.createHmac('sha1', saltKey).update(msg).digest('hex');
+                                const loopParams = new URLSearchParams({
+                                    uk, shareid, type: 'M3U8_AUTO_480', fid, sign: loopSig, timestamp: String(nowTime),
+                                    ...(jsToken ? { jsToken } : {}), esl: '1', isplayer: '1', ehps: '1', clienttype, app_id: '250528', channel, randsk, browserid,
+                                });
+                                const loopUrl = `https://${u.hostname}/share/streaming?${loopParams.toString()}`;
+                                const playlistRes = await fetch(loopUrl, { headers: segHeaders });
+                                if (!playlistRes.ok)
+                                    break;
+                                const text = await playlistRes.text();
+                                if (text.includes('errno') || !text.includes('#EXTINF:')) {
+                                    hasMoreSegs = false;
+                                    break;
                                 }
-                                catch { /* ignore */ } });
-                                unlinkSync(concatPath);
+                                const lines = text.split('\n').map((l) => l.trim()).filter((l) => l.startsWith('http'));
+                                let addedCount = 0;
+                                for (const seg of lines) {
+                                    const baseSegUrl = seg.split('&t=')[0] ?? seg;
+                                    if (!seenSegSet.has(baseSegUrl)) {
+                                        seenSegSet.add(baseSegUrl);
+                                        segUrls.push(seg);
+                                        addedCount++;
+                                    }
+                                }
+                                if (addedCount === 0 || text.includes('#EXT-X-ENDLIST'))
+                                    hasMoreSegs = false;
                             }
-                            catch { /* ignore */ }
+                            if (segUrls.length === 0)
+                                throw appErrors.temporaryProviderError('Playlist contains no segments.');
+                            const segDir = `${tmpdir()}/terabox-seg-${resolveId}-${itemId}`.replace(/\\/g, '/');
                             try {
-                                rmSync(segDir, { recursive: true, force: true });
+                                mkdirSync(segDir, { recursive: true });
                             }
-                            catch { /* ignore */ }
-                            if (code === 0)
-                                resolve();
-                            else
-                                reject(appErrors.temporaryProviderError(`Transmux failed (code ${code}): ${stderr.slice(-500)}`));
-                        });
-                        proc.on('error', e => reject(toAppError(e)));
-                    });
-                    fileInfo = await stat(tmpMp4Path).catch(() => null);
-                    if (!fileInfo || fileInfo.size < 1024)
-                        throw appErrors.temporaryProviderError('Generated playback file is empty.');
-                    // Validate with ffprobe (optional, but ensures correct MP4)
-                    try {
-                        const { runYtDlp: _unused, requireBinary: _unused2 } = await import('@3ap/adapters');
-                        // Use ffprobe if available: just check file exists
-                    }
-                    catch { /* ignore */ }
-                }
-                // Serve the temp MP4 with proper Range support (like handleStream)
-                const info = fileInfo;
-                const mimeType = 'video/mp4';
-                const rangeHeader = request.headers.range;
-                if (rangeHeader) {
-                    const m = /bytes=(\d*)-(\d*)/.exec(rangeHeader);
-                    if (m) {
-                        const start = m[1] ? parseInt(m[1], 10) : 0;
-                        const end = m[2] ? parseInt(m[2], 10) : info.size - 1;
-                        const chunkSize = end - start + 1;
-                        if (start >= info.size || end >= info.size || chunkSize <= 0) {
-                            reply.header('content-range', `bytes */${info.size}`);
-                            void reply.code(416);
-                            return;
+                            catch { }
+                            const localSegPaths = new Array(segUrls.length);
+                            const sBatchSize = 5;
+                            for (let i = 0; i < segUrls.length; i += sBatchSize) {
+                                const batch = segUrls.slice(i, i + sBatchSize);
+                                await Promise.all(batch.map(async (segUrl, idxInBatch) => {
+                                    const globalIdx = i + idxInBatch;
+                                    const segRes = await fetch(segUrl, { headers: segHeaders });
+                                    if (!segRes.ok)
+                                        throw appErrors.temporaryProviderError(`Failed to fetch segment ${globalIdx}`);
+                                    const buf = Buffer.from(await segRes.arrayBuffer());
+                                    if (buf.length < 100)
+                                        throw appErrors.temporaryProviderError('Segment too small');
+                                    const head = buf.slice(0, 200).toString('utf8');
+                                    if (head.includes('<!DOCTYPE') || head.includes('"errno"'))
+                                        throw appErrors.temporaryProviderError('Provider returned error for segment.');
+                                    const segPath = `${segDir}/seg-${String(globalIdx).padStart(5, '0')}.ts`.replace(/\\/g, '/');
+                                    writeFileSync(segPath, buf);
+                                    localSegPaths[globalIdx] = segPath;
+                                }));
+                            }
+                            const concatList = localSegPaths.map(p => `file '${p.replace(/'/g, "'\\''")}'`).join('\n');
+                            const concatPath = `${segDir}/concat.txt`.replace(/\\/g, '/');
+                            writeFileSync(concatPath, concatList);
+                            const tmpIncomplete = `${artifactPath}.incomplete`;
+                            await new Promise((resolve, reject) => {
+                                const args = ['-f', 'concat', '-safe', '0', '-i', concatPath, '-c', 'copy', '-movflags', 'faststart', '-y', tmpIncomplete];
+                                const proc = spawn('ffmpeg', args);
+                                let stderr = '';
+                                proc.stderr.on('data', d => stderr += d.toString());
+                                proc.on('close', async (code) => {
+                                    try {
+                                        localSegPaths.forEach(p => { try {
+                                            unlinkSync(p);
+                                        }
+                                        catch { } });
+                                        unlinkSync(concatPath);
+                                    }
+                                    catch { }
+                                    try {
+                                        rmSync(segDir, { recursive: true, force: true });
+                                    }
+                                    catch { }
+                                    if (code === 0) {
+                                        const st = await stat(tmpIncomplete).catch(() => null);
+                                        if (!st || st.size < 1024)
+                                            return reject(appErrors.temporaryProviderError('Generated playback file empty'));
+                                        await rename(tmpIncomplete, artifactPath);
+                                        resolve();
+                                    }
+                                    else
+                                        reject(appErrors.temporaryProviderError(`Transmux failed (code ${code}): ${stderr.slice(-500)}`));
+                                });
+                                proc.on('error', e => reject(toAppError(e)));
+                            });
+                        })();
+                        playbackInFlight.set(artifactKey, p);
+                        p.catch(async () => { await unlinkAsync(artifactPath).catch(() => { }); await unlinkAsync(`${artifactPath}.incomplete`).catch(() => { }); });
+                        p.finally(() => playbackInFlight.delete(artifactKey));
+                        try {
+                            await p;
+                            artifactGenerationMs = Date.now() - genStartTime;
                         }
-                        reply.header('content-range', `bytes ${start}-${end}/${info.size}`);
-                        reply.header('accept-ranges', 'bytes');
-                        reply.header('content-length', chunkSize);
-                        reply.header('content-type', mimeType);
-                        reply.header('content-disposition', 'inline');
-                        reply.header('cache-control', 'private, no-store');
-                        reply.header('access-control-expose-headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition');
-                        void reply.code(206);
-                        return createReadStream(tmpMp4Path, { start, end });
+                        catch (e) {
+                            throw e;
+                        }
+                    }
+                    else {
+                        await playbackInFlight.get(artifactKey);
+                        artifactCacheHit = true;
+                        artifactStatus = 'WAIT_HIT';
+                        artifactGenerationMs = Date.now() - genStartTime;
                     }
                 }
-                reply.header('content-type', mimeType);
-                reply.header('content-length', info.size);
+                // Unified Range serve via artifact
+                const rangeHeader = initialRangeHeader ?? request.headers.range;
+                const isHead = request.method === 'HEAD';
+                const statInfo = await stat(artifactPath).catch(() => null);
+                if (!statInfo)
+                    throw appErrors.temporaryProviderError('Playback artifact missing after generation');
+                const size = statInfo.size;
+                const rangeParse = (() => {
+                    if (!rangeHeader || !rangeHeader.startsWith('bytes='))
+                        return { isRange: false, valid: true, start: 0, end: size - 1 };
+                    const m = /bytes=(\d*)-(\d*)/.exec(rangeHeader);
+                    if (!m)
+                        return { isRange: true, valid: false, start: 0, end: 0 };
+                    const s = m[1] ? parseInt(m[1], 10) : 0;
+                    const e = m[2] ? parseInt(m[2], 10) : size - 1;
+                    if (Number.isNaN(s) || Number.isNaN(e) || s >= size || e >= size || s > e || s < 0 || e < 0)
+                        return { isRange: true, valid: false, start: s, end: e };
+                    return { isRange: true, valid: true, start: s, end: e };
+                })();
+                log.info('[Stream] playback artifact serve', { platform: record.platform, resolveId, itemId, formatId, range: rangeHeader ?? 'none', artifactStatus, artifactPath: artifactPath.split('/').pop(), generationMs: artifactGenerationMs, cacheHit: artifactCacheHit, size, httpStatus: !rangeParse.isRange ? 200 : !rangeParse.valid ? 416 : 206, contentType: 'video/mp4', contentLength: rangeParse.isRange && rangeParse.valid ? (rangeParse.end - rangeParse.start + 1) : size, contentRange: rangeParse.isRange && rangeParse.valid ? `bytes ${rangeParse.start}-${rangeParse.end}/${size}` : 'none', firstByteMs: artifactGenerationMs, disconnectState: clientDisconnected });
+                reply.header('content-type', 'video/mp4');
                 reply.header('accept-ranges', 'bytes');
                 reply.header('content-disposition', 'inline');
                 reply.header('cache-control', 'private, no-store');
                 reply.header('access-control-expose-headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition');
+                if (rangeParse.isRange && !rangeParse.valid) {
+                    reply.header('content-range', `bytes */${size}`);
+                    void reply.code(416);
+                    if (isHead)
+                        return;
+                    return;
+                }
+                if (rangeParse.isRange && rangeParse.valid) {
+                    const chunkSize = rangeParse.end - rangeParse.start + 1;
+                    reply.header('content-range', `bytes ${rangeParse.start}-${rangeParse.end}/${size}`);
+                    reply.header('content-length', chunkSize);
+                    void reply.code(206);
+                    if (isHead)
+                        return;
+                    const stream = createReadStream(artifactPath, { start: rangeParse.start, end: rangeParse.end });
+                    return stream;
+                }
+                reply.header('content-length', size);
                 void reply.code(200);
-                return createReadStream(tmpMp4Path);
+                if (isHead)
+                    return;
+                return createReadStream(artifactPath);
             }
+            // Terabox direct file (non-HLS) falls through to proxy path
             proxyHeaders = {
                 'user-agent': 'netdisk;',
                 referer: 'https://www.terabox.com/',
             };
+            streamUrl = sel;
         }
         else if (record.platform === 'tiktok') {
+            // ── TikTok unified artifact (no stdout pipe) ──
             const binary = await requireBinary(process.env.YT_DLP_PATH, log);
             const rawFormatId = (format.sourceSelector ?? format.formatId).replace(/^[vfa]:/, '');
             const isByteVc1 = rawFormatId.includes('bytevc1') || rawFormatId.includes('hevc') || rawFormatId.includes('h265');
-            broadcastLog('STREAM', 'UPSTREAM_REQUEST_STARTED', `Piping TikTok stream via yt-dlp (${rawFormatId}, bytevc1=${isByteVc1})`, { resolveId, itemId, formatId });
-            const ytFormatSelector = isByteVc1
-                ? `${rawFormatId}/best`
-                : `${rawFormatId}[vcodec^=h264]/${rawFormatId}[vcodec^=avc]/b[vcodec^=h264]/b[vcodec^=avc]/download/best`;
-            const ytProc = spawn(binary, [
-                '--no-warnings',
-                '--no-playlist',
-                '--format', ytFormatSelector,
-                '-o', '-',
-                item.sourceUrl,
-            ]);
-            if (isByteVc1) {
-                // Transcode ByteVC1 (HEVC) stream to browser-playable H.264 MP4 stream via FFmpeg
-                const ffmpegProc = spawn('ffmpeg', [
-                    '-i', 'pipe:0',
-                    '-c:v', 'libx264',
-                    '-preset', 'ultrafast',
-                    '-tune', 'zerolatency',
-                    '-c:a', 'copy',
-                    '-f', 'mp4',
-                    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-                    'pipe:1',
-                ]);
-                ytProc.stdout.pipe(ffmpegProc.stdin);
-                ytProc.stderr.on('data', (d) => log.debug('[TikTok yt-dlp stderr]', { data: d.toString().slice(0, 200) }));
-                ffmpegProc.stderr.on('data', (d) => {
-                    const errChunk = d.toString();
-                    if (errChunk.includes('Error') || errChunk.includes('error')) {
-                        broadcastLog('WARN', 'FFMPEG_STDERR', errChunk.slice(0, 200), { resolveId });
-                    }
-                });
-                request.raw.on('close', () => {
-                    if (!ytProc.killed)
-                        ytProc.kill('SIGKILL');
-                    if (!ffmpegProc.killed)
-                        ffmpegProc.kill('SIGKILL');
-                });
-                reply.header('content-type', 'video/mp4');
-                reply.header('accept-ranges', 'none');
-                reply.header('content-disposition', 'inline');
-                reply.header('cache-control', 'private, no-store');
-                void reply.code(200);
-                broadcastLog('STREAM', 'MEDIA_LOADSTART', `TikTok stream transcoding (ByteVC1 -> H.264) started`, { resolveId, itemId, formatId, contentType: 'video/mp4' });
-                return ffmpegProc.stdout;
+            const selector = isByteVc1 ? `${rawFormatId}/best` : `${rawFormatId}[vcodec^=h264]/${rawFormatId}[vcodec^=avc]/b[vcodec^=h264]/b[vcodec^=avc]/download/best`;
+            const existing = await stat(artifactPath).catch(() => null);
+            if (isPlaybackArtifactFresh(existing)) {
+                artifactCacheHit = true;
+                artifactStatus = 'HIT';
             }
             else {
-                request.raw.on('close', () => {
-                    if (!ytProc.killed) {
-                        log.info('[TikTok Stream] Client disconnected, terminating yt-dlp process', { resolveId, itemId });
-                        broadcastLog('STREAM', 'PLAYBACK_ABORTED', 'Client disconnected during TikTok streaming', { resolveId });
-                        ytProc.kill('SIGKILL');
+                if (!playbackInFlight.has(artifactKey)) {
+                    const p = (async () => {
+                        if (isByteVc1) {
+                            const hevcTmp = `${artifactPath}.hevc.tmp.mp4`;
+                            await ytdlpDownloadToFile(binary, selector, item.sourceUrl, hevcTmp);
+                            // Transcode HEVC → H264/AAC
+                            const tmpIncomplete = `${artifactPath}.incomplete`;
+                            await new Promise((resolve, reject) => {
+                                const args = ['-y', '-i', hevcTmp, '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-c:a', 'copy', '-movflags', 'faststart', tmpIncomplete];
+                                const proc = spawn('ffmpeg', args);
+                                let stderr = '';
+                                proc.stderr.on('data', d => stderr += d.toString());
+                                proc.on('close', async (code) => {
+                                    await unlinkAsync(hevcTmp).catch(() => { });
+                                    if (code === 0) {
+                                        const st = await stat(tmpIncomplete).catch(() => null);
+                                        if (!st || st.size < 1024)
+                                            return reject(appErrors.temporaryProviderError('Transcoded artifact too small'));
+                                        await rename(tmpIncomplete, artifactPath);
+                                        resolve();
+                                    }
+                                    else {
+                                        await unlinkAsync(tmpIncomplete).catch(() => { });
+                                        reject(appErrors.temporaryProviderError(`ByteVC1 transcode failed (code ${code}): ${stderr.slice(-500)}`));
+                                    }
+                                });
+                                proc.on('error', e => reject(toAppError(e)));
+                            });
+                        }
+                        else {
+                            await ytdlpDownloadToFile(binary, selector, item.sourceUrl, artifactPath);
+                        }
+                    })();
+                    playbackInFlight.set(artifactKey, p);
+                    p.catch(async () => { await unlinkAsync(artifactPath).catch(() => { }); await unlinkAsync(`${artifactPath}.incomplete`).catch(() => { }); });
+                    p.finally(() => playbackInFlight.delete(artifactKey));
+                    try {
+                        await p;
+                        artifactGenerationMs = Date.now() - genStartTime;
                     }
-                });
-                reply.header('content-type', 'video/mp4');
-                reply.header('accept-ranges', 'none');
-                reply.header('content-disposition', 'inline');
-                reply.header('cache-control', 'private, no-store');
-                void reply.code(200);
-                broadcastLog('STREAM', 'MEDIA_LOADSTART', `TikTok stream piping started`, { resolveId, itemId, formatId, contentType: 'video/mp4' });
-                return ytProc.stdout;
+                    catch (e) {
+                        throw e;
+                    }
+                }
+                else {
+                    await playbackInFlight.get(artifactKey);
+                    artifactCacheHit = true;
+                    artifactStatus = 'WAIT_HIT';
+                }
             }
+            const rangeHeader = initialRangeHeader ?? request.headers.range;
+            const isHead = request.method === 'HEAD';
+            const statInfo = await stat(artifactPath).catch(() => null);
+            if (!statInfo)
+                throw appErrors.temporaryProviderError('TikTok artifact missing after generation');
+            const size = statInfo.size;
+            const rangeParse = (() => {
+                if (!rangeHeader || !rangeHeader.startsWith('bytes='))
+                    return { isRange: false, valid: true, start: 0, end: size - 1 };
+                const m = /bytes=(\d*)-(\d*)/.exec(rangeHeader);
+                if (!m)
+                    return { isRange: true, valid: false, start: 0, end: 0 };
+                const s = m[1] ? parseInt(m[1], 10) : 0;
+                const e = m[2] ? parseInt(m[2], 10) : size - 1;
+                if (Number.isNaN(s) || Number.isNaN(e) || s >= size || e >= size || s > e)
+                    return { isRange: true, valid: false, start: s, end: e };
+                return { isRange: true, valid: true, start: s, end: e };
+            })();
+            log.info('[Stream] playback artifact serve', { platform: 'tiktok', resolveId, itemId, formatId, range: rangeHeader ?? 'none', artifactStatus, generationMs: artifactGenerationMs, cacheHit: artifactCacheHit, size, httpStatus: !rangeParse.isRange ? 200 : !rangeParse.valid ? 416 : 206, contentType: 'video/mp4', contentLength: rangeParse.isRange && rangeParse.valid ? (rangeParse.end - rangeParse.start + 1) : size, contentRange: rangeParse.isRange && rangeParse.valid ? `bytes ${rangeParse.start}-${rangeParse.end}/${size}` : 'none', firstByteMs: artifactGenerationMs, disconnectState: clientDisconnected, isByteVc1 });
+            reply.header('content-type', 'video/mp4');
+            reply.header('accept-ranges', 'bytes');
+            reply.header('content-disposition', 'inline');
+            reply.header('cache-control', 'private, no-store');
+            reply.header('access-control-expose-headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition');
+            if (rangeParse.isRange && !rangeParse.valid) {
+                reply.header('content-range', `bytes */${size}`);
+                void reply.code(416);
+                if (isHead)
+                    return;
+                return;
+            }
+            if (rangeParse.isRange && rangeParse.valid) {
+                const chunkSize = rangeParse.end - rangeParse.start + 1;
+                reply.header('content-range', `bytes ${rangeParse.start}-${rangeParse.end}/${size}`);
+                reply.header('content-length', chunkSize);
+                void reply.code(206);
+                if (isHead)
+                    return;
+                return createReadStream(artifactPath, { start: rangeParse.start, end: rangeParse.end });
+            }
+            reply.header('content-length', size);
+            void reply.code(200);
+            if (isHead)
+                return;
+            return createReadStream(artifactPath);
         }
         else {
+            // Early artifact hit for Instagram/Facebook: if seekable MP4 already cached, serve immediately without yt-dlp
+            if (record.platform === 'instagram' || record.platform === 'facebook') {
+                const earlyExisting = await stat(artifactPath).catch(() => null);
+                if (isPlaybackArtifactFresh(earlyExisting)) {
+                    const earlyRange = initialRangeHeader ?? request.headers.range;
+                    const earlyIsHead = request.method === 'HEAD';
+                    const earlySize = earlyExisting.size;
+                    const earlyRangeParse = (() => {
+                        if (!earlyRange || !earlyRange.startsWith('bytes='))
+                            return { isRange: false, valid: true, start: 0, end: earlySize - 1 };
+                        const m = /bytes=(\d*)-(\d*)/.exec(earlyRange);
+                        if (!m)
+                            return { isRange: true, valid: false, start: 0, end: 0 };
+                        const s = m[1] ? parseInt(m[1], 10) : 0;
+                        const e = m[2] ? parseInt(m[2], 10) : earlySize - 1;
+                        if (Number.isNaN(s) || Number.isNaN(e) || s >= earlySize || e >= earlySize || s > e)
+                            return { isRange: true, valid: false, start: s, end: e };
+                        return { isRange: true, valid: true, start: s, end: e };
+                    })();
+                    artifactCacheHit = true;
+                    artifactStatus = 'HIT_EARLY';
+                    artifactGenerationMs = 0;
+                    log.info('[Stream] playback artifact serve (early)', { platform: record.platform, resolveId, itemId, formatId, range: earlyRange ?? 'none', artifactStatus, size: earlySize, httpStatus: !earlyRangeParse.isRange ? 200 : !earlyRangeParse.valid ? 416 : 206 });
+                    reply.header('content-type', 'video/mp4');
+                    reply.header('accept-ranges', 'bytes');
+                    reply.header('content-disposition', 'inline');
+                    reply.header('cache-control', 'private, no-store');
+                    reply.header('access-control-expose-headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition');
+                    if (earlyRangeParse.isRange && !earlyRangeParse.valid) {
+                        reply.header('content-range', `bytes */${earlySize}`);
+                        void reply.code(416);
+                        if (earlyIsHead)
+                            return;
+                        return;
+                    }
+                    if (earlyRangeParse.isRange && earlyRangeParse.valid) {
+                        const chunkSize = earlyRangeParse.end - earlyRangeParse.start + 1;
+                        reply.header('content-range', `bytes ${earlyRangeParse.start}-${earlyRangeParse.end}/${earlySize}`);
+                        reply.header('content-length', chunkSize);
+                        void reply.code(206);
+                        if (earlyIsHead)
+                            return;
+                        return createReadStream(artifactPath, { start: earlyRangeParse.start, end: earlyRangeParse.end });
+                    }
+                    reply.header('content-length', earlySize);
+                    void reply.code(200);
+                    if (earlyIsHead)
+                        return;
+                    return createReadStream(artifactPath);
+                }
+            }
             proxyHeaders = {
                 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
                 ...(record.platform === 'youtube' ? { referer: 'https://www.youtube.com/' } : {}),
@@ -867,38 +1090,9 @@ export async function buildApp(deps) {
                     if (videoUrl && audioUrl) {
                         assertPublicHttpUrl(videoUrl);
                         assertPublicHttpUrl(audioUrl);
-                        // Codec compatibility analysis: STRATEGY 3 (Remux Copy) vs STRATEGY 4 (Transcode Fallback)
                         const isH264 = !vcodec || vcodec.includes('avc') || vcodec.includes('h264') || vcodec.includes('mp4v');
                         const isAacOrMp3 = !acodec || acodec.includes('aac') || acodec.includes('mp4a') || acodec.includes('mp3');
                         const needsTranscode = !isH264 || !isAacOrMp3;
-                        const codecArgs = needsTranscode
-                            ? [
-                                '-c:v', 'libx264',
-                                '-preset', 'ultrafast',
-                                '-tune', 'zerolatency',
-                                '-pix_fmt', 'yuv420p',
-                                '-c:a', 'aac',
-                                '-b:a', '128k',
-                            ]
-                            : [
-                                '-c:v', 'copy',
-                                '-c:a', 'copy',
-                            ];
-                        const headerStr = `User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36\r\n${record.platform === 'youtube' ? 'Referer: https://www.youtube.com/\r\n' : ''}`;
-                        const seekSeconds = parseFloat(query.ss ?? '0');
-                        const seekArgs = Number.isFinite(seekSeconds) && seekSeconds > 0 ? ['-ss', String(seekSeconds)] : [];
-                        const ffmpegArgs = [
-                            '-headers', headerStr,
-                            ...seekArgs,
-                            '-i', videoUrl,
-                            '-headers', headerStr,
-                            ...seekArgs,
-                            '-i', audioUrl,
-                            ...codecArgs,
-                            '-f', 'mp4',
-                            '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-                            'pipe:1',
-                        ];
                         const sanitizeUrl = (u) => {
                             try {
                                 const parsed = new URL(u);
@@ -918,7 +1112,6 @@ export async function buildApp(deps) {
                             inputAudioCodec: acodec || 'unknown/aac',
                             sanitizedVideoUrl: sanitizeUrl(videoUrl),
                             sanitizedAudioUrl: sanitizeUrl(audioUrl),
-                            sanitizedArgs: ffmpegArgs.map((a) => (a.startsWith('http') ? sanitizeUrl(a) : a)),
                             outputContentType: 'video/mp4',
                         });
                         broadcastLog('STREAM', 'FFMPEG_STARTED', `Spawning FFmpeg ${needsTranscode ? 'transcoder' : 'remuxer'} for ${format.height ?? 480}p MP4 playback`, {
@@ -928,70 +1121,83 @@ export async function buildApp(deps) {
                             strategy: needsTranscode ? 'TRANSCODE' : 'REMUX',
                             videoCodec: vcodec || 'h264',
                         });
-                        const ffmpegProc = spawn('ffmpeg', ffmpegArgs);
-                        let bytesEmitted = 0;
-                        let firstByteTimeMs = null;
-                        let isValidFtypHeader = false;
-                        let ffmpegStderr = '';
-                        let isClientDisconnected = false;
-                        const startTime = Date.now();
-                        ffmpegProc.stdout.on('data', (chunk) => {
-                            if (bytesEmitted === 0) {
-                                firstByteTimeMs = Date.now() - startTime;
-                                if (chunk.length >= 8 && chunk.toString('ascii', 4, 8) === 'ftyp') {
-                                    isValidFtypHeader = true;
+                        // ── Unified artifact: materialize to seekable MP4, not pipe ──
+                        const existingIg = await stat(artifactPath).catch(() => null);
+                        if (!isPlaybackArtifactFresh(existingIg)) {
+                            const keyIg = playbackCacheKey(resolveId, itemId, formatId);
+                            if (!playbackInFlight.has(keyIg)) {
+                                const pIg = (async () => {
+                                    await ffmpegRemuxUrlsToFile(videoUrl, audioUrl, artifactPath, needsTranscode);
+                                })();
+                                playbackInFlight.set(keyIg, pIg);
+                                pIg.catch(async () => { await unlinkAsync(artifactPath).catch(() => { }); await unlinkAsync(`${artifactPath}.incomplete`).catch(() => { }); });
+                                pIg.finally(() => playbackInFlight.delete(keyIg));
+                                try {
+                                    await pIg;
+                                    artifactGenerationMs = Date.now() - genStartTime;
+                                }
+                                catch (e) {
+                                    throw e;
                                 }
                             }
-                            bytesEmitted += chunk.length;
-                        });
-                        ffmpegProc.stderr.on('data', (data) => {
-                            const str = data.toString();
-                            if (ffmpegStderr.length < 4096)
-                                ffmpegStderr += str;
-                            if (str.toLowerCase().includes('error')) {
-                                broadcastLog('WARN', 'FFMPEG_STDERR', str.slice(0, 200), { resolveId });
+                            else {
+                                await playbackInFlight.get(keyIg);
+                                artifactCacheHit = true;
+                                artifactStatus = 'WAIT_HIT';
+                                artifactGenerationMs = Date.now() - genStartTime;
                             }
-                        });
-                        ffmpegProc.on('close', (code, signal) => {
-                            const elapsedMs = Date.now() - startTime;
-                            log.info('[DirectPlay FFmpeg Process Summary]', {
-                                resolveId,
-                                itemId,
-                                exitCode: code,
-                                exitSignal: signal,
-                                elapsedMs,
-                                timeToFirstByteMs: firstByteTimeMs,
-                                totalBytesEmitted: bytesEmitted,
-                                isValidFtypHeader,
-                                clientDisconnected: isClientDisconnected,
-                                ...(code !== 0 && !isClientDisconnected ? { ffmpegStderrTail: ffmpegStderr.slice(-1000) } : {}),
-                            });
-                        });
-                        // Cancellation safety: kill FFmpeg process immediately if client disconnects
-                        request.raw.on('close', () => {
-                            isClientDisconnected = true;
-                            if (!ffmpegProc.killed) {
-                                log.info('[DirectPlay FFmpeg] Client disconnected, terminating FFmpeg process', {
-                                    resolveId,
-                                    itemId,
-                                    bytesEmittedBeforeDisconnect: bytesEmitted,
-                                });
-                                broadcastLog('STREAM', 'PLAYBACK_ABORTED', 'Client disconnected during FFmpeg streaming', { resolveId });
-                                ffmpegProc.kill('SIGKILL');
-                            }
-                        });
+                        }
+                        else {
+                            artifactCacheHit = true;
+                            artifactStatus = 'HIT';
+                            artifactGenerationMs = 0;
+                        }
+                        // Serve via unified Range (HEAD supported, 206/416, Accept-Ranges bytes)
+                        const rangeHeaderIg = initialRangeHeader ?? request.headers.range;
+                        const isHeadIg = request.method === 'HEAD';
+                        const statIg = await stat(artifactPath).catch(() => null);
+                        if (!statIg)
+                            throw appErrors.temporaryProviderError('Playback artifact missing after remux');
+                        const sizeIg = statIg.size;
+                        const rangeIg = (() => {
+                            if (!rangeHeaderIg || !rangeHeaderIg.startsWith('bytes='))
+                                return { isRange: false, valid: true, start: 0, end: sizeIg - 1 };
+                            const m = /bytes=(\d*)-(\d*)/.exec(rangeHeaderIg);
+                            if (!m)
+                                return { isRange: true, valid: false, start: 0, end: 0 };
+                            const s = m[1] ? parseInt(m[1], 10) : 0;
+                            const e = m[2] ? parseInt(m[2], 10) : sizeIg - 1;
+                            if (Number.isNaN(s) || Number.isNaN(e) || s >= sizeIg || e >= sizeIg || s > e)
+                                return { isRange: true, valid: false, start: s, end: e };
+                            return { isRange: true, valid: true, start: s, end: e };
+                        })();
+                        log.info('[Stream] playback artifact serve', { platform: record.platform, resolveId, itemId, formatId, range: rangeHeaderIg ?? 'none', artifactStatus, generationMs: artifactGenerationMs, cacheHit: artifactCacheHit, size: sizeIg, httpStatus: !rangeIg.isRange ? 200 : !rangeIg.valid ? 416 : 206, contentType: 'video/mp4', contentLength: rangeIg.isRange && rangeIg.valid ? (rangeIg.end - rangeIg.start + 1) : sizeIg, contentRange: rangeIg.isRange && rangeIg.valid ? `bytes ${rangeIg.start}-${rangeIg.end}/${sizeIg}` : 'none', firstByteMs: artifactGenerationMs, disconnectState: clientDisconnected, strategy: needsTranscode ? 'TRANSCODE' : 'REMUX' });
                         reply.header('content-type', 'video/mp4');
-                        reply.header('accept-ranges', 'none');
+                        reply.header('accept-ranges', 'bytes');
                         reply.header('content-disposition', 'inline');
                         reply.header('cache-control', 'private, no-store');
+                        reply.header('access-control-expose-headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition');
+                        if (rangeIg.isRange && !rangeIg.valid) {
+                            reply.header('content-range', `bytes */${sizeIg}`);
+                            void reply.code(416);
+                            if (isHeadIg)
+                                return;
+                            return;
+                        }
+                        if (rangeIg.isRange && rangeIg.valid) {
+                            const chunkSize = rangeIg.end - rangeIg.start + 1;
+                            reply.header('content-range', `bytes ${rangeIg.start}-${rangeIg.end}/${sizeIg}`);
+                            reply.header('content-length', chunkSize);
+                            void reply.code(206);
+                            if (isHeadIg)
+                                return;
+                            return createReadStream(artifactPath, { start: rangeIg.start, end: rangeIg.end });
+                        }
+                        reply.header('content-length', sizeIg);
                         void reply.code(200);
-                        broadcastLog('STREAM', 'MEDIA_LOADSTART', `FFmpeg ${needsTranscode ? 'transcoding' : 'remuxing'} stream started for ${format.height ?? 480}p`, {
-                            resolveId,
-                            itemId,
-                            formatId,
-                            contentType: 'video/mp4',
-                        });
-                        return ffmpegProc.stdout;
+                        if (isHeadIg)
+                            return;
+                        return createReadStream(artifactPath);
                     }
                     else if (videoUrl) {
                         streamUrl = videoUrl;
